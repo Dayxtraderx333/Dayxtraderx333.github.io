@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#080A0C">
+<title>Trader Desk</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+
+<div id="scanlines" aria-hidden="true"></div>
+
+<!-- idle screensaver -->
+<section id="saver" class="screen">
+  <div class="saver-inner">
+    <div class="wordmark" id="wordmark">STOCKWITHME</div>
+    <div class="rule"></div>
+    <div class="saver-clock" id="saverClock">--:--:--</div>
+    <div class="saver-zone" id="saverZone">PACIFIC TIME</div>
+  </div>
+  <div class="saver-hint">TAP OR SCROLL</div>
+</section>
+
+<!-- main menu -->
+<section id="menu" class="screen hidden">
+  <header class="hdr">
+    <span class="hdr-title">TRADER DESK</span>
+    <span class="hdr-time"><span id="refreshClock">--:--</span><span class="pt"> PT</span></span>
+  </header>
+  <div id="menuScroll" class="menu-scroll">
+    <nav id="buttons">
+      <button class="cmd" data-cmd="brief">MORNING BRIEF</button>
+      <button class="cmd" data-cmd="pulse">MARKET PULSE</button>
+      <button class="cmd" data-cmd="spy">SPY / 0DTE</button>
+      <button class="cmd" data-cmd="options">OPTIONS DESK</button>
+      <button class="cmd" data-cmd="quote">TICKER LOOKUP</button>
+      <button class="cmd" data-cmd="scorecard">SCORECARD</button>
+      <button class="cmd" data-cmd="botstatus">BOT STATUS</button>
+    </nav>
+    <button id="unpairBtn" class="unpair" type="button">UNPAIR THIS DEVICE</button>
+  </div>
+  <div class="menu-hint">WHEEL MOVES · SIDE BUTTON OPENS</div>
+</section>
+
+<!-- ticker entry -->
+<section id="ticker" class="screen hidden">
+  <header class="hdr">
+    <button id="tickerBack" class="back" aria-label="Back">&#8810;</button>
+    <span class="hdr-title">TICKER LOOKUP</span>
+  </header>
+  <div class="ticker-row">
+    <input id="tickerInput" type="text" autocomplete="off" autocapitalize="characters"
+           spellcheck="false" maxlength="12" placeholder="SYMBOL">
+    <button id="goBtn" class="cmd small accent">GO</button>
+  </div>
+  <div class="chips-label">QUICK</div>
+  <div id="chips" class="chips"></div>
+  <div class="recent-label" id="recentLabel">RECENT</div>
+  <div id="recentList" class="recent"></div>
+</section>
+
+<!-- pairing -->
+<section id="pair" class="screen hidden">
+  <header class="hdr">
+    <span class="hdr-title">PAIR DEVICE</span>
+  </header>
+  <div class="pair-body">
+    <div class="pair-note">Type the 56-character pairing key once. Dashes and case don't matter. It stays on this r1 only.</div>
+    <textarea id="pairInput" rows="3" autocomplete="off" autocapitalize="characters" autocorrect="off"
+              spellcheck="false" maxlength="90" placeholder="XXXX-XXXX-XXXX-…"></textarea>
+    <div id="pairStatus" class="pair-status"></div>
+    <button id="pairBtn" class="cmd small accent" type="button">PAIR</button>
+  </div>
+</section>
+
+<!-- output -->
+<section id="output" class="screen hidden">
+  <header class="hdr">
+    <button id="backBtn" class="back" aria-label="Back">&#8810;</button>
+    <span class="hdr-title" id="outTitle">OUTPUT</span>
+  </header>
+  <div id="outputBody" class="output-body"><div class="line dim">READY</div></div>
+</section>
+
+<script src="./app.js"></script>
+</body>
+</html>

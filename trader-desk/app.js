@@ -1,0 +1,890 @@
+/* Trader Desk — static r1 creation (no secrets in this file).
+ *
+ * The page is self-hosted on GitHub Pages, so it cannot reach Anthony's Linux
+ * box directly. It talks to a small daemon on that box
+ * (bridge/traderdesk_bridge.py) through a public Piping Server on HTTPS 443,
+ * https://ppng.io:
+ *
+ *   page    --GET (blocking)-->  https://ppng.io/<reply channel for id>
+ *   page    --POST-->            https://ppng.io/<request channel>
+ *   bridge runs ONE allowlisted command and POSTs the encrypted answer.
+ *
+ * Security (protocol v1): a 256-bit device key K is typed in once on the
+ * pairing screen and kept in creationStorage on the r1. Nothing secret is in
+ * this file. Channels are HMAC-SHA256(K, "req-v1") and HMAC(K, "res-v1"+id),
+ * truncated to 128 bits; every message is AES-256-GCM with key
+ * HMAC(K, "aes-v1") and AAD "req|1|id|ts|cmd" / "res|1|id|ts|cmd".
+ * Without WebCrypto the page refuses to run (no plaintext fallback).
+ */
+(function () {
+  "use strict";
+
+  // --- relay channels (must match bridge/bridge.json) ---------------------
+  var RELAY = "https://ppng.io";
+  var PROTO = 1;
+  var B32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";   // Crockford base32
+
+  var PT_ZONE = "America/Los_Angeles";
+  var IDLE_MS = 45000;
+  var WAIT_MS = 140000;      // how long the page waits for the desk to answer
+  var QUICK = ["SPY", "QQQ", "NVDA", "CRWV", "AAPL", "TSLA", "MSFT", "META"];
+
+  var LABELS = {
+    brief: "MORNING BRIEF",
+    pulse: "MARKET PULSE",
+    spy: "SPY / 0DTE",
+    options: "OPTIONS DESK",
+    quote: "TICKER LOOKUP",
+    scorecard: "SCORECARD",
+    botstatus: "BOT STATUS"
+  };
+
+  // --- elements -----------------------------------------------------------
+  var $ = function (id) { return document.getElementById(id); };
+  var saver = $("saver"), menu = $("menu"), ticker = $("ticker"), output = $("output");
+  var saverClock = $("saverClock"), refreshClock = $("refreshClock");
+  var buttons = $("buttons"), menuScroll = $("menuScroll");
+  var outBody = $("outputBody"), outTitle = $("outTitle");
+  var tickerInput = $("tickerInput"), goBtn = $("goBtn"), chipsEl = $("chips");
+  var recentList = $("recentList"), recentLabel = $("recentLabel");
+  var pairScreen = $("pair"), pairInput = $("pairInput"), pairBtn = $("pairBtn");
+  var pairStatus = $("pairStatus"), unpairBtn = $("unpairBtn");
+
+  // --- state --------------------------------------------------------------
+  var screen = "saver";
+  var busy = false;
+  var selected = 0;
+  var lastRefresh = null;
+  var recent = [];
+  var idleTimer = null;
+  var pollAbort = 0;
+
+  // ------------------------------------------------------------------ store
+  function b64encode(s) {
+    try { return btoa(unescape(encodeURIComponent(s))); } catch (e) { return null; }
+  }
+  function b64decode(s) {
+    try { return decodeURIComponent(escape(atob(s))); } catch (e) { return null; }
+  }
+  var store = {
+    get: function (key) {
+      try {
+        if (window.creationStorage && window.creationStorage.plain) {
+          return window.creationStorage.plain.getItem(key).then(function (raw) {
+            return raw ? b64decode(raw) : null;
+          }).catch(function () { return null; });
+        }
+      } catch (e) { /* fall through */ }
+      try {
+        var r = localStorage.getItem(key);
+        return Promise.resolve(r ? b64decode(r) : null);
+      } catch (e2) {
+        return Promise.resolve(null);
+      }
+    },
+    set: function (key, value) {
+      var enc = b64encode(value);
+      if (enc === null) return Promise.resolve();
+      try {
+        if (window.creationStorage && window.creationStorage.plain) {
+          return window.creationStorage.plain.setItem(key, enc).catch(function () {});
+        }
+      } catch (e) { /* fall through */ }
+      try { localStorage.setItem(key, enc); } catch (e2) {}
+      return Promise.resolve();
+    }
+  };
+
+  // ------------------------------------------------------------------ clock
+  function ptParts(d) {
+    try {
+      var fmt = new Intl.DateTimeFormat("en-US", {
+        timeZone: PT_ZONE, hour: "2-digit", minute: "2-digit", second: "2-digit",
+        hour12: false
+      });
+      var o = {};
+      fmt.formatToParts(d).forEach(function (p) { o[p.type] = p.value; });
+      return { hh: o.hour === "24" ? "00" : o.hour, mm: o.minute, ss: o.second };
+    } catch (e) {
+      var h = String(d.getUTCHours() - 8);
+      return { hh: h.padStart(2, "0"), mm: String(d.getUTCMinutes()).padStart(2, "0"), ss: String(d.getUTCSeconds()).padStart(2, "0") };
+    }
+  }
+
+  function tickClocks() {
+    var now = new Date();
+    var p = ptParts(now);
+    saverClock.textContent = p.hh + ":" + p.mm + ":" + p.ss;
+    if (lastRefresh) {
+      var q = ptParts(lastRefresh);
+      refreshClock.textContent = q.hh + ":" + q.mm;
+    } else {
+      refreshClock.textContent = "--:--";
+    }
+  }
+
+  // ------------------------------------------------------------- screensaver
+  function showSaver() {
+    if (busy || !K) return;
+    screen = "saver";
+    pairScreen.classList.add("hidden");
+    ticker.classList.add("hidden");
+    menu.classList.add("hidden");
+    output.classList.add("hidden");
+    saver.classList.remove("hidden");
+  }
+
+  function wake() {
+    if (screen === "saver") showMenu();
+    resetIdle();
+  }
+
+  function resetIdle() {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(function () {
+      if (!busy && screen !== "pair") showSaver();
+    }, IDLE_MS);
+  }
+
+  function showMenu() {
+    screen = "menu";
+    pairScreen.classList.add("hidden");
+    saver.classList.add("hidden");
+    ticker.classList.add("hidden");
+    output.classList.add("hidden");
+    menu.classList.remove("hidden");
+    selectButton(selected);
+  }
+
+  function selectButton(i) {
+    var list = buttons.querySelectorAll(".cmd");
+    if (!list.length) return;
+    selected = ((i % list.length) + list.length) % list.length;
+    for (var k = 0; k < list.length; k++) {
+      list[k].classList.toggle("sel", k === selected);
+    }
+    scrollSelectedIntoView();
+  }
+
+  function scrollSelectedIntoView() {
+    var list = buttons.querySelectorAll(".cmd");
+    var el = list[selected];
+    if (!el) return;
+    var top = el.offsetTop;
+    var bottom = top + el.offsetHeight;
+    var view = menuScroll.scrollTop;
+    var h = menuScroll.clientHeight;
+    if (top < view) menuScroll.scrollTop = top;
+    else if (bottom > view + h) menuScroll.scrollTop = bottom - h;
+  }
+
+  // ----------------------------------------------------------------- speech
+  // Speech is short (SPEAK_MAX chars, cut at a sentence end) and goes out in
+  // sentence-sized chunks, one at a time. stopSpeech() cancels whatever has
+  // not been spoken yet, and is called on every tap, Back, side button and new
+  // request, so switching buttons never waits for the old reading to finish.
+  //
+  // Voice modes (tap the TRADER DESK title on the menu to cycle):
+  //   R1   r1 system speech via PluginMessageHandler (useLLM + wantsR1Response),
+  //        the documented path that speaks in the device's own voice.
+  //   WEB  the browser's speechSynthesis voice (fully interruptible).
+  //   OFF  silent; text on screen only.
+  var SPEAK_MAX = 350;
+  var CHUNK_MAX = 170;
+  var canBridge = typeof PluginMessageHandler !== "undefined";
+  var VOICE_MODES = ["r1", "web", "off"];
+  var VOICE_NAMES = { r1: "R1 VOICE", web: "WEB VOICE", off: "VOICE OFF" };
+  var voiceMode = canBridge ? "r1" : "web";
+  try {
+    var qv = (location.search.match(/[?&]voice=(r1|web|off)\b/) || [])[1];
+    if (qv) voiceMode = qv;
+  } catch (e) {}
+  var speechGen = 0;          // bumps on every stop; stale chunk timers bail
+  var chunkTimer = null;
+  var awaitingR1 = null;      // callback fired when the r1 answers a chunk
+
+  function speechSummary(text) {
+    var clean = String(text || "").replace(/\s+/g, " ").trim();
+    if (clean.length <= SPEAK_MAX) return clean;
+    var cut = clean.slice(0, SPEAK_MAX);
+    var m = cut.match(/^[\s\S]*[.!?](?=\s|$)/);
+    if (m && m[0].length > 80) return m[0];
+    return cut.replace(/\s+\S*$/, "") + ".";
+  }
+
+  function speechChunks(text) {
+    var sentences = String(text).replace(/([.!?])\s+/g, "$1\u0001").split("\u0001");
+    var out = [], cur = "";
+    sentences.forEach(function (sRaw) {
+      var sx = sRaw.trim();
+      if (!sx) return;
+      if (cur && (cur.length + 1 + sx.length) > CHUNK_MAX) { out.push(cur); cur = sx; }
+      else cur = cur ? cur + " " + sx : sx;
+    });
+    if (cur) out.push(cur);
+    return out;
+  }
+
+  function estMs(text) {
+    // ~15 spoken characters a second, plus a little breathing room
+    return Math.max(1200, Math.round(String(text || "").length / 15 * 1000) + 400);
+  }
+
+  function stopSpeech() {
+    speechGen++;
+    if (chunkTimer) { clearTimeout(chunkTimer); chunkTimer = null; }
+    awaitingR1 = null;
+    try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (e) {}
+    // The r1 creations API documents no stop/cancel message for system speech,
+    // so an r1 chunk already being read finishes; every queued chunk is dropped.
+  }
+
+  function speakR1Chunk(chunk, gen, next) {
+    try {
+      PluginMessageHandler.postMessage(JSON.stringify({
+        message: "Read the following text aloud exactly as written, word for word. " +
+                 "Do not add, remove, rephrase or comment on anything. Text: " + chunk,
+        useLLM: true,
+        wantsR1Response: true,
+        wantsJournalEntry: false
+      }));
+    } catch (e) { return false; }
+    var done = false;
+    var advance = function (spokenLen) {
+      if (done || gen !== speechGen) return;
+      done = true;
+      awaitingR1 = null;
+      if (chunkTimer) clearTimeout(chunkTimer);
+      chunkTimer = setTimeout(function () { if (gen === speechGen) next(); },
+        estMs(new Array((spokenLen || chunk.length) + 1).join("x")));
+    };
+    // when the r1 answers, wait about as long as the reading takes, then go on
+    awaitingR1 = function (data) {
+      var t = data && (data.message || data.data);
+      advance(typeof t === "string" ? Math.min(t.length, chunk.length * 1.3) : chunk.length);
+    };
+    // fallback if the r1 never echoes anything back
+    chunkTimer = setTimeout(function () { advance(chunk.length); }, estMs(chunk) + 4000);
+    return true;
+  }
+
+  function speakWebChunk(chunk, gen, next) {
+    if (!window.speechSynthesis || typeof SpeechSynthesisUtterance === "undefined") return false;
+    try {
+      var u = new SpeechSynthesisUtterance(chunk);
+      u.rate = 1.02;
+      u.onend = function () { if (gen === speechGen) next(); };
+      u.onerror = function () { if (gen === speechGen) next(); };
+      window.speechSynthesis.speak(u);
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function speak(text) {
+    stopSpeech();
+    if (!text || voiceMode === "off") return;
+    var chunks = speechChunks(speechSummary(text));
+    var gen = speechGen;
+    var i = 0;
+    var mode = (voiceMode === "r1" && canBridge) ? "r1" : "web";
+    var next = function () {
+      if (gen !== speechGen || i >= chunks.length) return;
+      var c = chunks[i++];
+      var ok = mode === "r1" ? speakR1Chunk(c, gen, next) : speakWebChunk(c, gen, next);
+      if (!ok && mode === "r1") { mode = "web"; ok = speakWebChunk(c, gen, next); }
+      if (!ok) console.warn("no speech channel available in this view");
+    };
+    next();
+  }
+
+  // r1 answers to our speech requests come back here; nothing is displayed
+  window.onPluginMessage = function (data) {
+    if (awaitingR1) { var f = awaitingR1; f(data); }
+  };
+
+  function cycleVoice() {
+    stopSpeech();
+    var k = VOICE_MODES.indexOf(voiceMode);
+    voiceMode = VOICE_MODES[(k + 1) % VOICE_MODES.length];
+    if (voiceMode === "r1" && !canBridge) voiceMode = "web";
+    store.set("voice", voiceMode);
+    var hint = document.querySelector(".menu-hint");
+    if (hint) {
+      var orig = hint.getAttribute("data-orig") || hint.textContent;
+      hint.setAttribute("data-orig", orig);
+      hint.textContent = VOICE_NAMES[voiceMode];
+      setTimeout(function () { hint.textContent = orig; }, 1800);
+    }
+  }
+
+  // ------------------------------------------------------------- colouring
+  function renderText(raw) {
+    var esc = String(raw)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+
+    return esc.replace(
+      /\b(up|gain(?:s|ed)?|higher|rally(?:ing)?|bullish|positive|beat|rose|rising|advanc(?:e|ed|ing))\b/gi,
+      '<span class="up">$1</span>'
+    ).replace(
+      /\b(down|loss|drop(?:ped|s)?|lower|sell-?off|bearish|negative|miss(?:ed)?|fell|falling|declin(?:e|ed|ing))\b/gi,
+      '<span class="down">$1</span>'
+    );
+  }
+
+  function setOutput(title, bodyHtml, metaHtml) {
+    outTitle.textContent = title;
+    outBody.innerHTML = (metaHtml ? '<div class="meta">' + metaHtml + "</div>" : "") +
+      '<div class="line">' + bodyHtml + "</div>";
+    outBody.scrollTop = 0;
+  }
+
+  function openOutput(title) {
+    screen = "output";
+    pairScreen.classList.add("hidden");
+    saver.classList.add("hidden");
+    menu.classList.add("hidden");
+    ticker.classList.add("hidden");
+    output.classList.remove("hidden");
+    outTitle.textContent = title;
+  }
+
+  // ----------------------------------------------------------------- crypto
+  var subtle = (window.crypto && window.crypto.subtle) ? window.crypto.subtle : null;
+  var enc = new TextEncoder(), dec = new TextDecoder();
+  var K = null;            // { hmac: CryptoKey, aes: CryptoKey, req: "td-…" }
+
+  function hex(buf) {
+    var b = new Uint8Array(buf), s = "";
+    for (var i = 0; i < b.length; i++) s += (b[i] < 16 ? "0" : "") + b[i].toString(16);
+    return s;
+  }
+  function unhex(s) {
+    var out = new Uint8Array(s.length / 2);
+    for (var i = 0; i < out.length; i++) out[i] = parseInt(s.substr(i * 2, 2), 16);
+    return out;
+  }
+  function b64(buf) {
+    var b = new Uint8Array(buf), s = "";
+    for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    return btoa(s);
+  }
+  function unb64(s) {
+    var bin = atob(s), out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  function randHex(n) {
+    var b = new Uint8Array(n);
+    crypto.getRandomValues(b);
+    return hex(b);
+  }
+  function hmacHex(text) {
+    return subtle.sign("HMAC", K.hmac, enc.encode(text)).then(hex);
+  }
+
+  // pairing code: 52 Crockford chars (256-bit key + 4 zero pad bits) + 4 check chars
+  function parsePairCode(input) {
+    var s = String(input || "").toUpperCase()
+      .replace(/[IL]/g, "1").replace(/O/g, "0").replace(/[^0-9A-Z]/g, "");
+    if (s.length !== 56) return Promise.reject(new Error("Need 56 characters, got " + s.length + "."));
+    var vals = [];
+    for (var i = 0; i < 56; i++) {
+      var v = B32.indexOf(s[i]);
+      if (v < 0) return Promise.reject(new Error("'" + s[i] + "' is not a valid character."));
+      vals.push(v);
+    }
+    var key = new Uint8Array(32), acc = 0, nbits = 0, k = 0;
+    for (var j = 0; j < 52; j++) {
+      acc = (acc << 5) | vals[j]; nbits += 5;
+      if (nbits >= 8) { nbits -= 8; key[k++] = (acc >> nbits) & 255; acc &= (1 << nbits) - 1; }
+    }
+    if (acc !== 0 || k !== 32) return Promise.reject(new Error("Typo somewhere: the key does not check out."));
+    var chk = (vals[52] << 15) | (vals[53] << 10) | (vals[54] << 5) | vals[55];
+    var data = new Uint8Array(10 + 32);
+    data.set(enc.encode("td-pair-v1"), 0); data.set(key, 10);
+    return subtle.digest("SHA-256", data).then(function (d) {
+      var h = new Uint8Array(d);
+      var want = ((h[0] << 16) | (h[1] << 8) | h[2]) >> 4;
+      if (want !== chk) throw new Error("Typo somewhere: the key does not check out.");
+      return hex(key);
+    });
+  }
+
+  function loadKeys(keyHex) {
+    var raw = unhex(keyHex);
+    return subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"])
+      .then(function (hk) {
+        return subtle.sign("HMAC", hk, enc.encode("aes-v1")).then(function (aesRaw) {
+          return subtle.importKey("raw", aesRaw, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+        }).then(function (ak) {
+          return subtle.sign("HMAC", hk, enc.encode("req-v1")).then(function (r) {
+            K = { hmac: hk, aes: ak, req: "td-" + hex(r).slice(0, 32) };
+            return K;
+          });
+        });
+      });
+  }
+
+  // device key storage: creationStorage.secure, then .plain, then localStorage
+  var KEY_NAME = "tdDeviceKey";
+  var keyStore = {
+    get: function () {
+      var cs = window.creationStorage;
+      var tryOne = function (area) {
+        try {
+          if (cs && cs[area]) {
+            return cs[area].getItem(KEY_NAME).then(function (r) { return r ? b64decode(r) : null; })
+              .catch(function () { return null; });
+          }
+        } catch (e) {}
+        return Promise.resolve(null);
+      };
+      return tryOne("secure").then(function (v) { return v || tryOne("plain"); }).then(function (v) {
+        if (v) return v;
+        try { var r = localStorage.getItem(KEY_NAME); return r ? b64decode(r) : null; } catch (e) { return null; }
+      });
+    },
+    set: function (value) {
+      var e64 = b64encode(value), cs = window.creationStorage;
+      var put = function (area) {
+        try {
+          if (cs && cs[area]) return cs[area].setItem(KEY_NAME, e64).then(function () { return true; })
+            .catch(function () { return false; });
+        } catch (e) {}
+        return Promise.resolve(false);
+      };
+      return put("secure").then(function (ok) { return ok || put("plain"); }).then(function (ok) {
+        if (!ok) { try { localStorage.setItem(KEY_NAME, e64); } catch (e) {} }
+      });
+    },
+    clear: function () {
+      var cs = window.creationStorage, jobs = [];
+      ["secure", "plain"].forEach(function (area) {
+        try { if (cs && cs[area]) jobs.push(cs[area].removeItem(KEY_NAME).catch(function () {})); } catch (e) {}
+      });
+      try { localStorage.removeItem(KEY_NAME); } catch (e) {}
+      return Promise.all(jobs);
+    }
+  };
+
+  // ---------------------------------------------------------------- relay
+  function newId() { return randHex(16); }
+
+  function postRequest(id, ts, cmd, arg) {
+    var iv = new Uint8Array(12);
+    crypto.getRandomValues(iv);
+    var aad = enc.encode("req|" + PROTO + "|" + id + "|" + ts + "|" + cmd);
+    var pt = enc.encode(JSON.stringify({ cmd: cmd, arg: arg || "" }));
+    return subtle.encrypt({ name: "AES-GCM", iv: iv, additionalData: aad }, K.aes, pt)
+      .then(function (ct) {
+        return fetch(RELAY + "/" + K.req, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain;charset=UTF-8" },
+          body: JSON.stringify({ v: PROTO, id: id, ts: ts, cmd: cmd, iv: b64(iv), ct: b64(ct) }),
+          cache: "no-store"
+        });
+      }).then(function (r) {
+        if (!r.ok) throw new Error("relay " + r.status);
+        return true;
+      });
+  }
+
+  function openReply(id, cmd, txt) {
+    var env = JSON.parse(txt);
+    if (!env || env.v !== PROTO || env.id !== id || typeof env.ts !== "number") throw new Error("bad reply");
+    var aad = enc.encode("res|" + PROTO + "|" + id + "|" + env.ts + "|" + cmd);
+    return subtle.decrypt({ name: "AES-GCM", iv: unb64(env.iv), additionalData: aad }, K.aes, unb64(env.ct))
+      .then(function (pt) {
+        var res = JSON.parse(dec.decode(pt));
+        if (!res || res.id !== id || res.cmd !== cmd) throw new Error("reply not bound to this request");
+        return res;
+      });
+  }
+
+  // Hold a blocking GET on this request's own reply channel. It resolves as
+  // soon as the desk POSTs the answer, and gives up after WAIT_MS.
+  function awaitResult(id, cmd, token, channelP) {
+    var ctl = null;
+    var timer = null;
+
+    var read = function () {
+      return channelP.then(function (ch) {
+        var opts = { cache: "no-store" };
+        if (typeof AbortController !== "undefined") {
+          ctl = new AbortController();
+          opts.signal = ctl.signal;
+        }
+        return fetch(RELAY + "/" + ch, opts);
+      }).then(function (r) { return r.text(); });
+    };
+
+    var wait = new Promise(function (resolve, reject) {
+      timer = setTimeout(function () {
+        try { if (ctl) ctl.abort(); } catch (e) {}
+        reject(new Error("timeout"));
+      }, WAIT_MS);
+      read().then(resolve, reject);
+    });
+
+    var guard = new Promise(function (resolve, reject) {
+      // a superseded request stops waiting
+      var iv = setInterval(function () {
+        if (token !== pollAbort) { clearInterval(iv); try { if (ctl) ctl.abort(); } catch (e) {} resolve(null); }
+      }, 300);
+      wait.then(function (v) { clearInterval(iv); resolve(v); },
+                function (e) { clearInterval(iv); reject(e); });
+    });
+
+    return guard.then(
+      function (txt) {
+        clearTimeout(timer);
+        if (txt === null || txt === undefined) return null;
+        return openReply(id, cmd, txt);
+      },
+      function (err) {
+        clearTimeout(timer);
+        if (token !== pollAbort) return null;
+        throw err;
+      }
+    );
+  }
+
+  function runCommand(cmd, arg, label) {
+    stopSpeech();
+    if (!K) { showPair(); return; }
+    busy = true;
+    var id = newId();
+    var token = ++pollAbort;      // supersedes any request still in flight
+    openOutput(label);
+    setOutput(label, '<span class="dim blink">CONNECTING…</span>',
+      "REQUESTING " + label + " FROM THE DESK");
+
+    var ts = Math.floor(Date.now() / 1000);
+    var channelP = hmacHex("res-v1" + id).then(function (h) { return "td-" + h.slice(0, 32); });
+    var answered = awaitResult(id, cmd, token, channelP);
+
+    channelP.then(function () { return postRequest(id, ts, cmd, arg); })
+      .then(function () {
+        if (token !== pollAbort) return null;
+        setOutput(label, '<span class="dim blink">WORKING…</span>',
+          "RUNNING ON THE DESK");
+        return answered;
+      })
+      .then(function (res) {
+        if (token !== pollAbort) return;          // late answer to an old tap
+        if (!res) { busy = false; resetIdle(); return; }
+        lastRefresh = new Date();
+        tickClocks();
+        var body = res.text || "(no output)";
+        setOutput(
+          label,
+          renderText(body),
+          (res.ok ? "" : "PARTIAL · ") + "UPDATED " + clockLabel(lastRefresh)
+        );
+        speak(body);
+        if (cmd === "quote" && res.ok) rememberTicker((res.arg || arg || "").toUpperCase());
+      })
+      .catch(function () {
+        if (token !== pollAbort) return;
+        setOutput(label,
+          '<span class="down">NO RESPONSE FROM THE DESK.</span>\n' +
+          '<span class="dim">The desk machine did not answer. Tap the button again to retry. ' +
+          'If this keeps happening, check the r1 clock is right or re-pair the device.</span>',
+          "OFFLINE");
+      })
+      .then(function () {
+        if (token !== pollAbort) return;
+        busy = false;
+        resetIdle();
+      });
+  }
+
+  function clockLabel(d) {
+    var p = ptParts(d);
+    return p.hh + ":" + p.mm + " PT";
+  }
+
+  // -------------------------------------------------------------- tickers
+  function renderChips() {
+    chipsEl.innerHTML = "";
+    QUICK.forEach(function (sym) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.textContent = sym;
+      b.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        resetIdle();
+        tickerInput.value = sym;
+        runCommand("quote", sym, "QUOTE " + sym);
+      });
+      chipsEl.appendChild(b);
+    });
+  }
+
+  function renderRecent() {
+    recentList.innerHTML = "";
+    if (!recent.length) {
+      recentLabel.textContent = "";
+      return;
+    }
+    recentLabel.textContent = "RECENT";
+    recent.forEach(function (sym) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.textContent = sym;
+      b.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        resetIdle();
+        runCommand("quote", sym, "QUOTE " + sym);
+      });
+      recentList.appendChild(b);
+    });
+  }
+
+  function rememberTicker(sym) {
+    if (!sym || !/^[A-Z0-9.\-^]{1,12}$/.test(sym)) return;
+    recent = [sym].concat(recent.filter(function (s) { return s !== sym; })).slice(0, 5);
+    store.set("recent", JSON.stringify(recent));
+    renderRecent();
+  }
+
+  function openTicker() {
+    screen = "ticker";
+    pairScreen.classList.add("hidden");
+    saver.classList.add("hidden");
+    menu.classList.add("hidden");
+    output.classList.add("hidden");
+    ticker.classList.remove("hidden");
+    tickerInput.value = "";
+    tickerInput.placeholder = "SYMBOL";
+    renderRecent();
+    try { tickerInput.focus(); } catch (e) {}
+  }
+
+  function submitTicker(value) {
+    var sym = String(value || "").trim().toUpperCase();
+    if (!sym) return;
+    if (!/^[A-Z0-9.\-^]{1,12}$/.test(sym)) {
+      tickerInput.value = "";
+      tickerInput.placeholder = "LETTERS ONLY";
+      return;
+    }
+    runCommand("quote", sym, "QUOTE " + sym);
+  }
+
+  // -------------------------------------------------------------- pairing
+  function showPair(msg, bad) {
+    screen = "pair";
+    saver.classList.add("hidden");
+    menu.classList.add("hidden");
+    ticker.classList.add("hidden");
+    output.classList.add("hidden");
+    pairScreen.classList.remove("hidden");
+    pairStatus.textContent = msg || "";
+    pairStatus.className = "pair-status" + (bad ? " bad" : "");
+    if (!subtle) {
+      pairStatus.textContent = "SECURE CRYPTO (WEBCRYPTO) IS NOT AVAILABLE IN THIS VIEW. " +
+        "TRADER DESK WILL NOT RUN WITHOUT IT.";
+      pairStatus.className = "pair-status bad";
+      pairBtn.disabled = true;
+      pairInput.disabled = true;
+    }
+  }
+
+  function doPair() {
+    if (!subtle) return;
+    pairStatus.textContent = "CHECKING…";
+    pairStatus.className = "pair-status";
+    parsePairCode(pairInput.value).then(function (keyHex) {
+      return loadKeys(keyHex).then(function () { return keyStore.set(keyHex); });
+    }).then(function () {
+      pairInput.value = "";
+      pairStatus.textContent = "PAIRED.";
+      pairStatus.className = "pair-status good";
+      setTimeout(showMenu, 700);
+    }).catch(function (e) {
+      pairStatus.textContent = String((e && e.message) || "That key did not work.").toUpperCase();
+      pairStatus.className = "pair-status bad";
+    });
+  }
+
+  pairBtn.addEventListener("click", function (ev) { ev.stopPropagation(); doPair(); });
+  pairInput.addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter") { ev.preventDefault(); doPair(); }
+  });
+
+  var unpairArmed = null;
+  unpairBtn.addEventListener("click", function (ev) {
+    ev.stopPropagation();
+    if (!unpairArmed) {
+      unpairBtn.classList.add("armed");
+      unpairBtn.textContent = "TAP AGAIN TO UNPAIR";
+      unpairArmed = setTimeout(function () {
+        unpairArmed = null;
+        unpairBtn.classList.remove("armed");
+        unpairBtn.textContent = "UNPAIR THIS DEVICE";
+      }, 3000);
+      return;
+    }
+    clearTimeout(unpairArmed); unpairArmed = null;
+    unpairBtn.classList.remove("armed");
+    unpairBtn.textContent = "UNPAIR THIS DEVICE";
+    stopSpeech();
+    pollAbort++; busy = false; K = null;
+    keyStore.clear().then(function () { showPair("UNPAIRED. TYPE A KEY TO PAIR AGAIN."); });
+  });
+
+  // ---------------------------------------------------------------- input
+  buttons.addEventListener("click", function (ev) {
+    var btn = ev.target.closest(".cmd");
+    if (!btn) return;
+    stopSpeech();
+    resetIdle();
+    var cmd = btn.dataset.cmd;
+    if (cmd === "quote") { openTicker(); return; }
+    runCommand(cmd, "", LABELS[cmd] || cmd.toUpperCase());
+  });
+
+  $("backBtn").addEventListener("click", function () {
+    stopSpeech();
+    pollAbort++; busy = false;
+    resetIdle();
+    showMenu();
+  });
+  $("tickerBack").addEventListener("click", function () {
+    stopSpeech();
+    resetIdle();
+    showMenu();
+  });
+
+  goBtn.addEventListener("click", function (ev) {
+    ev.stopPropagation();
+    resetIdle();
+    submitTicker(tickerInput.value);
+  });
+
+  tickerInput.addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      submitTicker(tickerInput.value);
+    }
+  });
+  tickerInput.addEventListener("input", function () {
+    tickerInput.value = tickerInput.value.toUpperCase().replace(/[^A-Z0-9.\-^]/g, "");
+    resetIdle();
+  });
+
+  // --------------------------------------------------- wheel + side button
+  function scrollyTarget() {
+    if (screen === "output") return outBody;
+    if (screen === "ticker") return recent.length ? recentList : null;
+    if (screen === "menu") return menuScroll;
+    return null;
+  }
+
+  function onScrollDelta(dir) {
+    if (screen === "pair") return;
+    if (screen === "saver") { showMenu(); resetIdle(); return; }
+    resetIdle();
+    if (screen === "menu") {
+      selectButton(selected + dir);
+      return;
+    }
+    var t = scrollyTarget();
+    if (t) t.scrollBy({ top: dir * 46, behavior: "auto" });
+  }
+
+  window.addEventListener("scrollDown", function () { onScrollDelta(1); });
+  window.addEventListener("scrollUp", function () { onScrollDelta(-1); });
+
+  window.addEventListener("sideClick", function () {
+    stopSpeech();
+    if (screen === "pair") { doPair(); return; }
+    if (screen === "saver") { showMenu(); resetIdle(); return; }
+    resetIdle();
+    if (screen === "menu") {
+      var list = buttons.querySelectorAll(".cmd");
+      if (list[selected]) list[selected].click();
+    } else {
+      pollAbort++; busy = false;
+      showMenu();
+    }
+  });
+
+  // keyboard stand-ins for desktop testing
+  window.addEventListener("keydown", function (ev) {
+    if (ev.target === pairInput) return;
+    if (ev.target === tickerInput) {
+      if (ev.key === "Escape") showMenu();
+      return;
+    }
+    if (ev.key === " " || ev.key === "Escape") stopSpeech();
+    if (ev.key === " ") {
+      ev.preventDefault();
+      if (screen === "menu") {
+        var list = buttons.querySelectorAll(".cmd");
+        if (list[selected]) list[selected].click();
+      } else if (screen === "saver") {
+        showMenu();
+        resetIdle();
+      }
+    } else if (ev.key === "ArrowDown") {
+      onScrollDelta(1);
+    } else if (ev.key === "ArrowUp") {
+      onScrollDelta(-1);
+    } else if (ev.key === "Escape") {
+      if (screen !== "menu") { pollAbort++; busy = false; showMenu(); }
+    }
+  });
+
+  // tap anywhere wakes / resets idle
+  document.addEventListener("pointerdown", function () {
+    stopSpeech();
+    if (screen === "pair") return;
+    if (screen === "saver") { showMenu(); }
+    resetIdle();
+  }, true);
+
+  // ------------------------------------------------------------------ boot
+  function boot() {
+    tickClocks();
+    setInterval(tickClocks, 1000);
+    renderChips();
+    var title = document.querySelector("#menu .hdr-title");
+    if (title) title.addEventListener("click", function (ev) { ev.stopPropagation(); cycleVoice(); });
+    store.get("voice").then(function (v) {
+      if (v && VOICE_MODES.indexOf(v) >= 0 && !/[?&]voice=/.test(location.search)) {
+        voiceMode = (v === "r1" && !canBridge) ? "web" : v;
+      }
+    });
+    store.get("recent").then(function (raw) {
+      if (!raw) return;
+      try {
+        var arr = JSON.parse(raw);
+        if (Array.isArray(arr)) recent = arr.slice(0, 5);
+      } catch (e) {}
+      renderRecent();
+    });
+    if (!subtle) { showPair(); return; }
+    keyStore.get().then(function (keyHex) {
+      if (!keyHex || !/^[0-9a-f]{64}$/.test(keyHex)) { showPair(); return; }
+      return loadKeys(keyHex).then(function () {
+        showSaver();
+        setTimeout(function () {
+          if (screen === "saver") showMenu();
+        }, 6000);
+        resetIdle();
+      });
+    }).catch(function () { showPair("STORED KEY COULD NOT BE LOADED. PAIR AGAIN.", true); });
+  }
+
+  if (typeof document !== "undefined") {
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", boot);
+    } else {
+      boot();
+    }
+  }
+})();

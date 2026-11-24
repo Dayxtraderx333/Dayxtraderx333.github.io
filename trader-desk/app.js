@@ -37,12 +37,10 @@
   // v5-compact (Nov 24 2026): six top-level sections; every older view is a
   // sub-item of its parent section. Commands are unchanged (no bridge change).
   var SECTIONS = [
-    { id: "morning", label: "MORNING BRIEF", items: [
-      { cmd: "brief", label: "MANAGER BRIEF" },
-      { cmd: "whales", label: "WHALES · RAW SCAN", raw: true },
-      { cmd: "oversold", label: "OVERSOLD · RAW SCAN", raw: true },
-      { cmd: "research", label: "RESEARCH · RAW SCAN", raw: true }
-    ], note: "RAW SCANS ARE NOT VERIFIED BY MANAGER" },
+    // Morning Brief = Manager-verified data only (Anthony 4:59 AM PT). The
+    // whales / oversold / research bridge commands stay allowlisted but are
+    // intentionally not on the page.
+    { id: "morning", label: "MORNING BRIEF", cmd: "brief" },
     { id: "top3", label: "TOP 3", cmd: "top3" },
     { id: "pulse", label: "MARKET PULSE", cmd: "pulse" },
     { id: "spy", label: "SPY 0DTE", items: [

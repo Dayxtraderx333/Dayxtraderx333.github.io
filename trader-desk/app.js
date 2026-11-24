@@ -9,11 +9,14 @@
  *   page    --POST-->            https://ppng.io/<request channel>
  *   bridge runs ONE allowlisted command and POSTs the encrypted answer.
  *
- * Security (protocol v1): a 256-bit device key K is typed in once on the
+ * Security (protocol v2): a 256-bit device key K is typed in once on the
  * pairing screen and kept in creationStorage on the r1. Nothing secret is in
  * this file. Channels are HMAC-SHA256(K, "req-v1") and HMAC(K, "res-v1"+id),
  * truncated to 128 bits; every message is AES-256-GCM with key
- * HMAC(K, "aes-v1") and AAD "req|1|id|ts|cmd" / "res|1|id|ts|cmd".
+ * HMAC(K, "aes-v1") and AAD "req|2|id|ts" / "res|2|id|ts". The command is
+ * only inside the ciphertext; request plaintext is padded to 64 bytes and
+ * replies to fixed size buckets. The key lives in r1 creationStorage
+ * (secure first, verified plain fallback); browser localStorage only with ?test=1.
  * Without WebCrypto the page refuses to run (no plaintext fallback).
  */
 (function () {
@@ -21,7 +24,9 @@
 
   // --- relay channels (must match bridge/bridge.json) ---------------------
   var RELAY = "https://ppng.io";
-  var PROTO = 1;
+  var PROTO = 2;
+  var REQ_PAD = 64;
+  var TEST_MODE = /[?&]test=1(&|$)/.test(location.search);
   var B32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";   // Crockford base32
 
   var PT_ZONE = "America/Los_Angeles";
@@ -179,31 +184,30 @@
   }
 
   // ----------------------------------------------------------------- speech
-  // Spoken text is capped to SPEAK_MAX chars (cut at a sentence end); the
-  // full text stays on screen.
+  // Exact numbers matter more than voice, and r1 speech goes through the r1
+  // assistant, which can paraphrase or round. So by default the r1 says only a
+  // short fixed cue ("Market Pulse ready"); the exact text is on screen.
   //
   // Voice modes (tap the TRADER DESK title on the menu to cycle):
-  //   R1 VOICE   (default) PluginMessageHandler {message, useLLM:false,
-  //              wantsR1Response:true, wantsJournalEntry:false} — byte-for-byte
-  //              the call the OS3-hosted page made, which is the one shape
-  //              proven to make sound on Anthony's r1.
-  //   R1 ASSIST  PluginMessageHandler {useLLM:true, wantsR1Response:true} —
-  //              the creations-SDK "Speak on R1" demo shape (the r1 assistant
-  //              reads it back); not confirmed to make sound on this r1.
-  //   WEB VOICE  speechSynthesis, chunked and instantly interruptible (often
-  //              missing in the r1 WebView).
-  //   OFF        silent.
-  // The r1 bridge objects are looked up when speaking, not at page load,
-  // because the r1 can inject them after the script starts. R1 speech is sent
-  // as ONE message; the SDK has no stop call, so it plays to the end (<=350
-  // chars). A status line under the output shows what was actually done.
-  var SPEAK_MAX = 200;      // 1-2 sentences: starts faster, ends sooner
-  var CHUNK_MAX = 170;
-  var VOICE_MODES = ["r1direct", "r1", "web", "off"];
-  var VOICE_NAMES = { r1direct: "R1 VOICE", r1: "R1 ASSIST", web: "WEB VOICE", off: "VOICE OFF" };
-  var voiceMode = "r1direct";
+  //   CUE   (default) speak "<button> ready" / "<TICKER> ready" — no numbers
+  //   FULL  read the first ~200 chars of the result (may be reworded by the r1)
+  //   OFF   silent
+  // Speech call = the OS3-proven shape: PluginMessageHandler.postMessage(
+  //   JSON.stringify({message, useLLM:false, wantsR1Response:true,
+  //   wantsJournalEntry:false})), looked up at speak time (the r1 may inject
+  //   it after load). No TTS stop exists in the SDK; on leaving the creation
+  //   the page tries CreationVoiceHandler start/stop (grabs audio focus, if
+  //   present) and closeWebView.
+  var SPEAK_MAX = 200;
+  var VOICE_MODES = ["cue", "full", "off"];
+  var VOICE_NAMES = { cue: "VOICE: CUE ONLY", full: "VOICE: READ FULL", off: "VOICE: OFF" };
+  var CUES = {
+    brief: "Morning brief ready", pulse: "Market pulse ready", spy: "SPY desk ready",
+    options: "Options desk ready", scorecard: "Scorecard ready", botstatus: "Bot status ready"
+  };
+  var voiceMode = "cue";
   try {
-    var qv = (location.search.match(/[?&]voice=(r1|r1direct|web|off)(&|$)/) || [])[1];
+    var qv = (location.search.match(/[?&]voice=(cue|full|off)(&|$)/) || [])[1];
     if (qv) voiceMode = qv;
   } catch (e) {}
   var speechGen = 0;
@@ -222,136 +226,90 @@
     var el = document.getElementById("voiceStatus");
     if (el) el.textContent = text;
   }
-  function hhmmss() {
-    var p = ptParts(new Date());
-    return p.hh + ":" + p.mm + ":" + p.ss;
-  }
 
   function speechSummary(text) {
     var clean = String(text || "").replace(/\s+/g, " ").trim();
     if (clean.length <= SPEAK_MAX) return clean;
     var cut = clean.slice(0, SPEAK_MAX);
     var m = cut.match(/^[\s\S]*[.!?](?=\s|$)/);
-    if (m && m[0].length > 80) return m[0];
+    if (m && m[0].length > 60) return m[0];
     return cut.replace(/\s+\S*$/, "") + ".";
   }
 
-  function speechChunks(text) {
-    var sentences = String(text).replace(/([.!?])\s+/g, "$1\u0001").split("\u0001");
-    var out = [], cur = "";
-    sentences.forEach(function (sRaw) {
-      var sx = sRaw.trim();
-      if (!sx) return;
-      if (cur && (cur.length + 1 + sx.length) > CHUNK_MAX) { out.push(cur); cur = sx; }
-      else cur = cur ? cur + " " + sx : sx;
-    });
-    if (cur) out.push(cur);
-    return out;
+  function cueFor(cmd, arg, ok) {
+    var c = cmd === "quote" ? (String(arg || "").toUpperCase().split("").join(" ") + " ready") : (CUES[cmd] || "Ready");
+    return ok === false ? c.replace(/ready$/, "partial result") : c;
   }
 
-  // r1 interrupt: the creations SDK documents no stop/cancel for r1 speech.
-  // Best-known trick: send a new, near-empty speak message so the r1 replaces
-  // what it is reading. Variants are selectable (tap the grey voice line on
-  // the output screen, or ?interrupt=space|dot|empty|none):
-  //   space  {message:" ",  useLLM:false, wantsR1Response:true}   (default)
-  //   dot    {message:".",  useLLM:false, wantsR1Response:true}
-  //   empty  {message:"",   useLLM:false, wantsR1Response:true}
-  //   none   send nothing
-  var INT_MODES = ["space", "dot", "empty", "none"];
-  var INT_MSG = { space: " ", dot: ".", empty: "" };
-  var intMode = "space";
-  try {
-    var qi = (location.search.match(/[?&]interrupt=(space|dot|empty|none)(&|$)/) || [])[1];
-    if (qi) intMode = qi;
-  } catch (e) {}
-  var r1SpeakingUntil = 0;     // when the current r1 reading should be over
-  var lastInterrupt = "";
-
-  function interruptR1(force) {
-    if (intMode === "none" || !hasBridge()) return false;
-    if (!force && Date.now() > r1SpeakingUntil) return false;   // nothing playing
-    try {
-      window.PluginMessageHandler.postMessage(JSON.stringify({
-        message: INT_MSG[intMode], useLLM: false, wantsR1Response: true, wantsJournalEntry: false
-      }));
-      r1SpeakingUntil = 0;
-      lastInterrupt = "INT " + intMode.toUpperCase() + " SENT " + hhmmss();
-      voiceStatus(voiceLine("STOPPED"));
-      return true;
-    } catch (e) { return false; }
-  }
-
-  function stopSpeech(force) {
+  function stopSpeech() {
     speechGen++;
     try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (e) {}
-    interruptR1(force === true);
   }
 
-  function voiceLine(what) {
-    return "VOICE: " + VOICE_NAMES[voiceMode] + " · INT: " + intMode.toUpperCase() + (what ? " · " + what : "");
+  function sayR1(text) {
+    window.PluginMessageHandler.postMessage(JSON.stringify({
+      message: text, useLLM: false, wantsR1Response: true, wantsJournalEntry: false
+    }));
   }
 
-  function speakR1(text, direct) {
-    var payload = direct
-      ? { message: text, useLLM: false, wantsR1Response: true, wantsJournalEntry: false }
-      : { message: "Read the following text aloud exactly as written, word for word. " +
-                   "Do not add, remove, rephrase or comment on anything. Text: " + text,
-          useLLM: true, wantsR1Response: true, wantsJournalEntry: false };
-    window.PluginMessageHandler.postMessage(JSON.stringify(payload));
-  }
-
-  function speakWeb(text, gen) {
-    var chunks = speechChunks(text), i = 0;
-    var next = function () {
-      if (gen !== speechGen || i >= chunks.length) return;
-      var u = new SpeechSynthesisUtterance(chunks[i++]);
-      u.rate = 1.02;
-      u.onend = function () { if (gen === speechGen) next(); };
-      u.onerror = function (ev) {
-        if (gen === speechGen) voiceStatus("VOICE: WEB VOICE ERROR " + ((ev && ev.error) || "").toUpperCase());
-      };
-      window.speechSynthesis.speak(u);
-    };
-    next();
-  }
-
-  function speak(text) {
+  // speak(text, cmd, arg, ok): called the moment a result arrives
+  function speak(text, cmd, arg, ok) {
     stopSpeech();
-    if (!text) return;
-    if (voiceMode === "off") { voiceStatus("VOICE: OFF (TAP TRADER DESK TITLE TO CHANGE)"); return; }
-    var summary = speechSummary(text);
-    var gen = speechGen;
-    var mode = voiceMode;
-    if ((mode === "r1" || mode === "r1direct") && !hasBridge()) {
-      mode = hasWeb() ? "web" : "none";
-    }
-    if (mode === "web" && !hasWeb()) mode = hasBridge() ? "r1direct" : "none";
+    if (voiceMode === "off") { voiceStatus(VOICE_NAMES.off + " (TAP TITLE TO CHANGE)"); return; }
+    var say = voiceMode === "full" ? speechSummary(text) : cueFor(cmd, arg, ok);
+    if (!say) return;
     try {
-      if (mode === "r1" || mode === "r1direct") {
-        speakR1(summary, mode === "r1direct");
-        lastSpeakAt = Date.now();
-        r1SpeakingUntil = lastSpeakAt + Math.round(summary.length / 14 * 1000) + 6000;
-        var tapMs = lastTapAt ? (lastSpeakAt - lastTapAt) : 0;
-        voiceStatus(voiceLine("SENT " + summary.length + " CH" + (tapMs ? " · TAP→SPEAK " + (tapMs / 1000).toFixed(1) + "S" : "")));
-        window.__tdLastTapToSpeakMs = tapMs;
-      } else if (mode === "web") {
-        speakWeb(summary, gen);
-        voiceStatus("VOICE: WEB VOICE · SPEAKING " + summary.length + " CHARS · " + hhmmss() + " PT");
+      if (hasBridge()) {
+        sayR1(say);
+      } else if (hasWeb()) {
+        var u = new SpeechSynthesisUtterance(say);
+        window.speechSynthesis.speak(u);
       } else {
-        voiceStatus("VOICE: NO SPEECH CHANNEL IN THIS VIEW (NO R1 BRIDGE, NO WEB SPEECH)");
+        voiceStatus(VOICE_NAMES[voiceMode] + " · NO SPEECH CHANNEL IN THIS VIEW");
+        return;
       }
+      lastSpeakAt = Date.now();
+      var tapMs = lastTapAt ? (lastSpeakAt - lastTapAt) : 0;
+      window.__tdLastTapToSpeakMs = tapMs;
+      voiceStatus(VOICE_NAMES[voiceMode] + " · SENT " + say.length + " CH" +
+        (tapMs ? " · TAP→SPEAK " + (tapMs / 1000).toFixed(1) + "S" : ""));
     } catch (e) {
-      voiceStatus("VOICE: " + (VOICE_NAMES[mode] || mode) + " FAILED · " + String(e && e.message || e).toUpperCase().slice(0, 60));
+      voiceStatus(VOICE_NAMES[voiceMode] + " · FAILED · " + String(e && e.message || e).toUpperCase().slice(0, 50));
     }
   }
 
-  // the r1 reports back here after a speak request; show only that it did
+  // r1 replies after a speak request arrive here; voice input is not used
   window.onPluginMessage = function (data) {
-    if (!lastSpeakAt) return;
-    var kind = data && (data.type || (data.data ? "data" : data.message ? "message" : "event"));
-    voiceStatus(voiceLine("r1 REPLIED (" + String(kind || "?").toUpperCase() +
-      ") +" + ((Date.now() - lastSpeakAt) / 1000).toFixed(1) + "S"));
+    if (!lastSpeakAt || (data && data.type === "sttEnded")) return;
+    voiceStatus(VOICE_NAMES[voiceMode] + " · r1 REPLIED +" + ((Date.now() - lastSpeakAt) / 1000).toFixed(1) + "S");
   };
+
+  // leaving the creation: best-effort stop of r1 audio, then close the view
+  var leaving = false;
+  function onLeave(why) {
+    if (leaving) return;
+    leaving = true;
+    stopSpeech();
+    try {
+      if (typeof window.CreationVoiceHandler !== "undefined" && window.CreationVoiceHandler &&
+          typeof window.CreationVoiceHandler.postMessage === "function") {
+        window.CreationVoiceHandler.postMessage("start");   // grab audio focus…
+        window.CreationVoiceHandler.postMessage("stop");    // …and release at once
+      }
+    } catch (e) {}
+    try {
+      if (why !== "pagehide" && typeof window.closeWebView !== "undefined" && window.closeWebView &&
+          typeof window.closeWebView.postMessage === "function") {
+        window.closeWebView.postMessage("");
+      }
+    } catch (e) {}
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "hidden") onLeave("hidden");
+    else leaving = false;
+  });
+  window.addEventListener("pagehide", function () { onLeave("pagehide"); });
+  window.addEventListener("pageshow", function () { leaving = false; });
 
   function flashHint(text) {
     var hint = document.querySelector(".menu-hint");
@@ -362,31 +320,17 @@
     setTimeout(function () { hint.textContent = orig; }, 6000);
   }
 
-  function cycleInterrupt() {
-    var k = INT_MODES.indexOf(intMode);
-    intMode = INT_MODES[(k + 1) % INT_MODES.length];
-    store.set("interrupt", intMode);
-    voiceStatus(voiceLine("SELECTED"));
-  }
-
-  // leaving the creation: stop the r1 reading
-  document.addEventListener("visibilitychange", function () {
-    if (document.visibilityState === "hidden") stopSpeech(true);
-  });
-  window.addEventListener("pagehide", function () { stopSpeech(true); });
-  window.addEventListener("beforeunload", function () { stopSpeech(true); });
-
   function cycleVoice() {
     stopSpeech();
     var k = VOICE_MODES.indexOf(voiceMode);
     voiceMode = VOICE_MODES[(k + 1) % VOICE_MODES.length];
-    store.set("voice2", voiceMode);
-    voiceStatus("VOICE: " + VOICE_NAMES[voiceMode] + " SELECTED");
+    store.set("voice3", voiceMode);
+    voiceStatus(VOICE_NAMES[voiceMode] + " SELECTED");
     var hint = document.querySelector(".menu-hint");
     if (hint) {
       var orig = hint.getAttribute("data-orig") || hint.textContent;
       hint.setAttribute("data-orig", orig);
-      hint.textContent = VOICE_NAMES[voiceMode];
+      hint.textContent = VOICE_NAMES[voiceMode].replace("VOICE: ", "");
       setTimeout(function () { hint.textContent = orig; }, 1800);
     }
   }
@@ -568,11 +512,16 @@
         var tried = [];
         var next = function (names) {
           if (!names.length) {
-            if (!cs) {   // not running inside an r1 creation (desktop browser)
-              try {
-                var r = decodeStored(localStorage.getItem(KEY_NAME));
-                if (r) { storageNote = "KEY FROM " + LABEL.local; return r; }
-              } catch (e) {}
+            var legacy = null;
+            try { legacy = decodeStored(localStorage.getItem(KEY_NAME)); } catch (e) {}
+            if (legacy && !cs && TEST_MODE) { storageNote = "KEY FROM " + LABEL.local + " (TEST)"; return legacy; }
+            if (legacy && cs) {
+              // a key from an older version in browser storage: move it into r1 storage
+              return keyStore.set(legacy).then(function () {
+                try { localStorage.removeItem(KEY_NAME); } catch (e) {}
+                storageNote = storageNote.replace("SAVED TO", "MOVED TO");
+                return legacy;
+              }, function () { return null; });
             }
             storageNote = "NO SAVED KEY · STORAGE " + (cs ? "PRESENT (" +
               ["secure", "plain"].filter(function (n) { return area(n); }).join("+").toUpperCase() + ")" : "MISSING") +
@@ -593,6 +542,7 @@
     set: function (value) {
       return waitForStorage(3000).then(function (cs) {
         if (!cs) {
+          if (!TEST_MODE) return Promise.reject(new Error("r1 creation storage is not available here; pairing refused. Open Trader Desk as an r1 creation."));
           try {
             localStorage.setItem(KEY_NAME, btoa(value));
             if (decodeStored(localStorage.getItem(KEY_NAME)) === value) {
@@ -603,7 +553,10 @@
           throw new Error("Could not save the key on this device.");
         }
         return writeArea("secure", value).then(function (ok) {
-          if (ok) { storageNote = "SAVED TO " + LABEL.secure + " · VERIFIED"; return "secure"; }
+          if (ok) {
+            try { localStorage.removeItem(KEY_NAME); } catch (e) {}
+            storageNote = "SAVED TO " + LABEL.secure + " · VERIFIED"; return "secure";
+          }
           return writeArea("plain", value).then(function (ok2) {
             if (ok2) { storageNote = "SAVED TO " + LABEL.plain + " · VERIFIED (SECURE FAILED)"; return "plain"; }
             throw new Error("The r1 did not keep the key (secure and plain storage both failed). Not paired.");
@@ -628,11 +581,15 @@
   function postRequest(id, ts, cmd, arg, token) {
     var iv = new Uint8Array(12);
     crypto.getRandomValues(iv);
-    var aad = enc.encode("req|" + PROTO + "|" + id + "|" + ts + "|" + cmd);
-    var pt = enc.encode(JSON.stringify({ cmd: cmd, arg: arg || "" }));
+    var aad = enc.encode("req|" + PROTO + "|" + id + "|" + ts);
+    var raw = enc.encode(JSON.stringify({ cmd: cmd, arg: arg || "" }));
+    if (raw.length > REQ_PAD) return Promise.reject(new Error("request too long"));
+    var pt = new Uint8Array(REQ_PAD);
+    pt.fill(32);                 // pad with spaces: still valid JSON
+    pt.set(raw, 0);
     return subtle.encrypt({ name: "AES-GCM", iv: iv, additionalData: aad }, K.aes, pt)
       .then(function (ct) {
-        var body = JSON.stringify({ v: PROTO, id: id, ts: ts, cmd: cmd, iv: b64(iv), ct: b64(ct) });
+        var body = JSON.stringify({ v: PROTO, id: id, ts: ts, iv: b64(iv), ct: b64(ct) });
         // The relay allows one sender per channel at a time, so a quick second
         // tap can be refused while the first is still being handed over.
         // Retry briefly; a duplicate delivery is dropped by the bridge as a replay.
@@ -659,7 +616,7 @@
   function openReply(id, cmd, txt) {
     var env = JSON.parse(txt);
     if (!env || env.v !== PROTO || env.id !== id || typeof env.ts !== "number") throw new Error("bad reply");
-    var aad = enc.encode("res|" + PROTO + "|" + id + "|" + env.ts + "|" + cmd);
+    var aad = enc.encode("res|" + PROTO + "|" + id + "|" + env.ts);
     return subtle.decrypt({ name: "AES-GCM", iv: unb64(env.iv), additionalData: aad }, K.aes, unb64(env.ct))
       .then(function (pt) {
         var res = JSON.parse(dec.decode(pt));
@@ -745,7 +702,7 @@
         lastRefresh = new Date();
         tickClocks();
         var body = res.text || "(no output)";
-        speak(body);                              // speak first, then render
+        speak(body, cmd, res.arg || arg, res.ok);  // cue first, then render
         setOutput(
           label,
           renderText(body),
@@ -1012,6 +969,7 @@
       onScrollDelta(-1);
     } else if (ev.key === "Escape") {
       if (screen !== "menu") { pollAbort++; busy = false; showMenu(); }
+      else onLeave("back");
     }
   });
 
@@ -1032,12 +990,7 @@
     if (title) title.addEventListener("click", function (ev) { ev.stopPropagation(); cycleVoice(); });
     // "voice2": earlier versions could save WEB VOICE when the r1 bridge was
     // injected late, which made the r1 silent; old choices are ignored.
-    store.get("interrupt").then(function (v) {
-      if (v && INT_MODES.indexOf(v) >= 0 && !/[?&]interrupt=/.test(location.search)) intMode = v;
-    });
-    var vsEl = document.getElementById("voiceStatus");
-    if (vsEl) vsEl.addEventListener("click", function (ev) { ev.stopPropagation(); cycleInterrupt(); });
-    store.get("voice2").then(function (v) {
+    store.get("voice3").then(function (v) {
       if (v && VOICE_MODES.indexOf(v) >= 0 && !/[?&]voice=/.test(location.search)) voiceMode = v;
     });
     store.get("recent").then(function (raw) {

@@ -41,7 +41,13 @@
     options: "OPTIONS DESK",
     quote: "TICKER LOOKUP",
     scorecard: "SCORECARD",
-    botstatus: "BOT STATUS"
+    botstatus: "BOT STATUS",
+    top3: "TOP 3",
+    optbrief: "OPTIONS BRIEF",
+    tape: "TAPE 0DTE",
+    whales: "WHALES",
+    oversold: "OVERSOLD",
+    research: "RESEARCH"
   };
 
   // --- elements -----------------------------------------------------------
@@ -204,7 +210,9 @@
   var VOICE_NAMES = { cue: "VOICE: CUE ONLY", full: "VOICE: READ FULL", off: "VOICE: OFF" };
   var CUES = {
     brief: "Morning brief ready", pulse: "Market pulse ready", spy: "SPY desk ready",
-    options: "Options desk ready", scorecard: "Scorecard ready", botstatus: "Bot status ready"
+    options: "Options desk ready", scorecard: "Scorecard ready", botstatus: "Bot status ready",
+    top3: "Top 3 ready", optbrief: "Options brief ready", tape: "Tape ready",
+    whales: "Whales ready", oversold: "Oversold ready", research: "Research ready"
   };
   var voiceMode = "cue";
   try {

@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#080A0C">
 <title>Trader Desk</title>
 <link rel="icon" type="image/png" href="./icon.png?v=2">
-<link rel="stylesheet" href="./style.css?v=20261124-v2-cuefix">
+<link rel="stylesheet" href="./style.css?v=20261124-v3-speakbtn">
 </head>
 <body>
 
@@ -82,9 +82,15 @@
     <span class="hdr-title" id="outTitle">OUTPUT</span>
   </header>
   <div id="outputBody" class="output-body"><div class="line dim">READY</div></div>
-  <div id="voiceStatus" class="voice-status">VOICE: CUE ONLY</div>
+  <div class="voice-bar">
+    <button id="voiceBtn" class="vbtn" type="button" aria-label="Change voice mode">VOICE: CUE</button>
+    <button id="speakBtn" class="vbtn speak" type="button" aria-label="Speak this screen">&#9654; SPEAK</button>
+  </div>
+  <div id="voiceStatus" class="voice-status">TAP SPEAK TO HEAR THIS SCREEN</div>
 </section>
 
-<script src="./app.js?v=20261124-v2-cuefix"></script>
+<div id="toast" class="toast hidden" aria-live="polite"></div>
+
+<script src="./app.js?v=20261124-v3-speakbtn"></script>
 </body>
 </html>

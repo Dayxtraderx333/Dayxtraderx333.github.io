@@ -188,7 +188,8 @@
   // assistant, which can paraphrase or round. So by default the r1 says only a
   // short fixed cue ("Market Pulse ready"); the exact text is on screen.
   //
-  // Voice modes (tap the TRADER DESK title on the menu to cycle):
+  // Voice modes (tap the VOICE button on a result screen, or the TRADER DESK
+  // title on the menu, to cycle). The SPEAK button reads the current screen.
   //   CUE   (default) speak "<button> ready" / "<TICKER> ready" — no numbers
   //   FULL  read the first ~200 chars of the result (may be reworded by the r1)
   //   OFF   silent
@@ -210,8 +211,11 @@
     var qv = (location.search.match(/[?&]voice=(cue|full|off)(&|$)/) || [])[1];
     if (qv) voiceMode = qv;
   } catch (e) {}
+  var SPEAK_NOW_MAX = 400;   // SPEAK button: first ~400 chars of the screen
+  var SHORT_NAMES = { cue: "VOICE: CUE", full: "VOICE: FULL", off: "VOICE: OFF" };
   var speechGen = 0;
   var lastSpeakAt = 0;
+  var lastBody = "";         // plain text of the result on screen (for SPEAK)
 
   function hasBridge() {
     try {
@@ -227,10 +231,11 @@
     if (el) el.textContent = text;
   }
 
-  function speechSummary(text) {
+  function speechSummary(text, max) {
+    max = max || SPEAK_MAX;
     var clean = String(text || "").replace(/\s+/g, " ").trim();
-    if (clean.length <= SPEAK_MAX) return clean;
-    var cut = clean.slice(0, SPEAK_MAX);
+    if (clean.length <= max) return clean;
+    var cut = clean.slice(0, max);
     var m = cut.match(/^[\s\S]*[.!?](?=\s|$)/);
     if (m && m[0].length > 60) return m[0];
     return cut.replace(/\s+\S*$/, "") + ".";
@@ -255,9 +260,14 @@
   // speak(text, cmd, arg, ok): called the moment a result arrives
   function speak(text, cmd, arg, ok) {
     stopSpeech();
-    if (voiceMode === "off") { voiceStatus(VOICE_NAMES.off + " (TAP TITLE TO CHANGE)"); return; }
+    if (voiceMode === "off") { voiceStatus("VOICE OFF · TAP SPEAK TO HEAR THIS SCREEN"); return; }
     var say = voiceMode === "full" ? speechSummary(text) : cueFor(cmd, arg, ok);
-    if (!say) return;
+    sendSpeech(say, VOICE_NAMES[voiceMode]);
+  }
+
+  // sendSpeech(say, label): one OS3-shaped message to the r1 speaker
+  function sendSpeech(say, label) {
+    if (!say) return false;
     try {
       if (hasBridge()) {
         sayR1(say);
@@ -265,17 +275,72 @@
         var u = new SpeechSynthesisUtterance(say);
         window.speechSynthesis.speak(u);
       } else {
-        voiceStatus(VOICE_NAMES[voiceMode] + " · NO SPEECH CHANNEL IN THIS VIEW");
-        return;
+        voiceStatus(label + " · NO SPEECH CHANNEL IN THIS VIEW");
+        return false;
       }
       lastSpeakAt = Date.now();
       var tapMs = lastTapAt ? (lastSpeakAt - lastTapAt) : 0;
       window.__tdLastTapToSpeakMs = tapMs;
-      voiceStatus(VOICE_NAMES[voiceMode] + " · SENT " + say.length + " CH" +
-        (tapMs ? " · TAP→SPEAK " + (tapMs / 1000).toFixed(1) + "S" : ""));
+      voiceStatus(label + " · SENT " + say.length + " CHARS");
+      return true;
     } catch (e) {
-      voiceStatus(VOICE_NAMES[voiceMode] + " · FAILED · " + String(e && e.message || e).toUpperCase().slice(0, 50));
+      voiceStatus(label + " · FAILED · " + String(e && e.message || e).toUpperCase().slice(0, 50));
+      return false;
     }
+  }
+
+  // SPEAK button / wheel-free action: read the current screen right now,
+  // whatever the voice mode (OFF only silences automatic speech).
+  function speakNow() {
+    stopSpeech();
+    lastTapAt = Date.now();
+    var text = lastBody;
+    if (!text) {
+      var raw = outBody ? (outBody.innerText || outBody.textContent || "") : "";
+      text = raw.replace(/^(UPDATED|PARTIAL)[^\n]*\n?/, "");
+    }
+    var say = speechSummary(text, SPEAK_NOW_MAX);
+    if (!say || /^(READY|CONNECTING…|WORKING…)$/.test(say)) {
+      toast("NOTHING TO READ YET");
+      return;
+    }
+    if (sendSpeech(say, "SPEAKING")) toast("SPEAKING…");
+  }
+
+  function toast(text) {
+    var el = document.getElementById("toast");
+    if (!el) return;
+    el.textContent = text;
+    el.classList.remove("hidden");
+    if (toast.t) clearTimeout(toast.t);
+    toast.t = setTimeout(function () { el.classList.add("hidden"); }, 1400);
+  }
+
+  function renderVoiceBtn() {
+    var b = document.getElementById("voiceBtn");
+    if (!b) return;
+    b.textContent = SHORT_NAMES[voiceMode] || "VOICE";
+    b.classList.toggle("off", voiceMode === "off");
+  }
+
+  // fast, robust tap binding for the r1 WebView: pointerup/touchend/click,
+  // whichever fires first wins; the others are swallowed by a debounce.
+  function bindTap(el, fn) {
+    if (!el) return;
+    var last = 0;
+    var fire = function (ev) {
+      if (ev) { ev.stopPropagation(); if (ev.type !== "pointerup" && ev.cancelable) ev.preventDefault(); }
+      var now = Date.now();
+      if (now - last < 450) return;
+      last = now;
+      el.classList.add("pressed");
+      setTimeout(function () { el.classList.remove("pressed"); }, 150);
+      resetIdle();
+      fn();
+    };
+    el.addEventListener("pointerup", fire);
+    el.addEventListener("touchend", fire);
+    el.addEventListener("click", fire);
   }
 
   // r1 replies after a speak request arrive here; voice input is not used
@@ -325,7 +390,9 @@
     var k = VOICE_MODES.indexOf(voiceMode);
     voiceMode = VOICE_MODES[(k + 1) % VOICE_MODES.length];
     store.set("voice3", voiceMode);
-    voiceStatus(VOICE_NAMES[voiceMode] + " SELECTED");
+    renderVoiceBtn();
+    toast(VOICE_NAMES[voiceMode]);
+    voiceStatus(VOICE_NAMES[voiceMode] + " SELECTED" + (voiceMode === "full" ? " · TAP SPEAK TO HEAR NOW" : ""));
     var hint = document.querySelector(".menu-hint");
     if (hint) {
       var orig = hint.getAttribute("data-orig") || hint.textContent;
@@ -679,6 +746,7 @@
     stopSpeech();
     if (!K) { showPair(); return; }
     busy = true;
+    lastBody = "";
     var id = newId();
     var token = ++pollAbort;      // supersedes any request still in flight
     openOutput(label);
@@ -702,6 +770,7 @@
         lastRefresh = new Date();
         tickClocks();
         var body = res.text || "(no output)";
+        lastBody = body;
         speak(body, cmd, res.arg || arg, res.ok);  // cue first, then render
         setOutput(
           label,
@@ -988,10 +1057,15 @@
     renderChips();
     var title = document.querySelector("#menu .hdr-title");
     if (title) title.addEventListener("click", function (ev) { ev.stopPropagation(); cycleVoice(); });
+    bindTap($("voiceBtn"), cycleVoice);
+    bindTap($("speakBtn"), speakNow);
+    bindTap($("voiceStatus"), speakNow);   // the grey line under the buttons speaks too
+    renderVoiceBtn();
     // "voice2": earlier versions could save WEB VOICE when the r1 bridge was
     // injected late, which made the r1 silent; old choices are ignored.
     store.get("voice3").then(function (v) {
       if (v && VOICE_MODES.indexOf(v) >= 0 && !/[?&]voice=/.test(location.search)) voiceMode = v;
+      renderVoiceBtn();
     });
     store.get("recent").then(function (raw) {
       if (!raw) return;

@@ -302,6 +302,15 @@
     if (awaitingR1) { var f = awaitingR1; f(data); }
   };
 
+  function flashHint(text) {
+    var hint = document.querySelector(".menu-hint");
+    if (!hint || !text) return;
+    var orig = hint.getAttribute("data-orig") || hint.textContent;
+    hint.setAttribute("data-orig", orig);
+    hint.textContent = text;
+    setTimeout(function () { hint.textContent = orig; }, 6000);
+  }
+
   function cycleVoice() {
     stopSpeech();
     var k = VOICE_MODES.indexOf(voiceMode);
@@ -427,42 +436,121 @@
       });
   }
 
-  // device key storage: creationStorage.secure, then .plain, then localStorage
+  // device key storage on the r1: window.creationStorage (async, values must be
+  // base64). Secure first, plain creationStorage if secure fails. Every save is
+  // read back and compared before "PAIRED" is shown. On launch the page waits
+  // for the r1 to inject creationStorage before deciding whether to ask for the
+  // key (an early read used to miss it and fall back to empty localStorage).
   var KEY_NAME = "tdDeviceKey";
+  var storageNote = "";          // shown on screen; never contains the key
+  function validKey(v) { return typeof v === "string" && /^[0-9a-f]{64}$/.test(v); }
+  function withTimeout(p, ms) {
+    return new Promise(function (resolve, reject) {
+      var t = setTimeout(function () { reject(new Error("storage timeout")); }, ms);
+      Promise.resolve(p).then(function (v) { clearTimeout(t); resolve(v); },
+                              function (e) { clearTimeout(t); reject(e); });
+    });
+  }
+  function waitForStorage(ms) {
+    return new Promise(function (resolve) {
+      var t0 = Date.now();
+      (function poll() {
+        if (window.creationStorage && (window.creationStorage.secure || window.creationStorage.plain)) {
+          return resolve(window.creationStorage);
+        }
+        if (Date.now() - t0 >= ms) return resolve(null);
+        setTimeout(poll, 100);
+      })();
+    });
+  }
+  // getItem may hand back base64 (documented), base64 with line breaks, or an
+  // already-decoded string on some builds: accept any of those.
+  function decodeStored(raw) {
+    if (raw === null || raw === undefined) return null;
+    if (typeof raw === "object") raw = raw.value || raw.data || raw.item || "";
+    var s = String(raw).replace(/^"|"$/g, "");
+    var compact = s.replace(/\s+/g, "");
+    if (validKey(compact)) return compact;
+    var d1 = null;
+    try { d1 = atob(compact); } catch (e) {}
+    if (d1 && validKey(d1.trim())) return d1.trim();
+    try { var d2 = atob(String(d1 || "").replace(/\s+/g, "")); if (validKey(d2.trim())) return d2.trim(); } catch (e) {}
+    return null;
+  }
+  function area(name) {
+    try { var cs = window.creationStorage; return cs && cs[name] ? cs[name] : null; } catch (e) { return null; }
+  }
+  function readArea(name) {
+    var a = area(name);
+    if (!a) return Promise.resolve(null);
+    try {
+      return withTimeout(a.getItem(KEY_NAME), 4000).then(decodeStored, function () { return null; });
+    } catch (e) { return Promise.resolve(null); }
+  }
+  function writeArea(name, value) {
+    var a = area(name);
+    if (!a) return Promise.resolve(false);
+    try {
+      return withTimeout(a.setItem(KEY_NAME, btoa(value)), 4000)
+        .then(function () { return readArea(name); })
+        .then(function (back) { return back === value; }, function () { return false; });
+    } catch (e) { return Promise.resolve(false); }
+  }
+  var LABEL = { secure: "SECURE STORAGE", plain: "PLAIN CREATION STORAGE", local: "BROWSER LOCALSTORAGE" };
   var keyStore = {
     get: function () {
-      var cs = window.creationStorage;
-      var tryOne = function (area) {
-        try {
-          if (cs && cs[area]) {
-            return cs[area].getItem(KEY_NAME).then(function (r) { return r ? b64decode(r) : null; })
-              .catch(function () { return null; });
+      return waitForStorage(3000).then(function (cs) {
+        var tried = [];
+        var next = function (names) {
+          if (!names.length) {
+            if (!cs) {   // not running inside an r1 creation (desktop browser)
+              try {
+                var r = decodeStored(localStorage.getItem(KEY_NAME));
+                if (r) { storageNote = "KEY FROM " + LABEL.local; return r; }
+              } catch (e) {}
+            }
+            storageNote = "NO SAVED KEY · STORAGE " + (cs ? "PRESENT (" +
+              ["secure", "plain"].filter(function (n) { return area(n); }).join("+").toUpperCase() + ")" : "MISSING") +
+              (tried.length ? " · CHECKED " + tried.join(", ").toUpperCase() : "");
+            return null;
           }
-        } catch (e) {}
-        return Promise.resolve(null);
-      };
-      return tryOne("secure").then(function (v) { return v || tryOne("plain"); }).then(function (v) {
-        if (v) return v;
-        try { var r = localStorage.getItem(KEY_NAME); return r ? b64decode(r) : null; } catch (e) { return null; }
+          var n = names[0];
+          if (!area(n)) return next(names.slice(1));
+          tried.push(n);
+          return readArea(n).then(function (v) {
+            if (v) { storageNote = "KEY FROM " + LABEL[n]; return v; }
+            return next(names.slice(1));
+          });
+        };
+        return next(["secure", "plain"]);
       });
     },
     set: function (value) {
-      var e64 = b64encode(value), cs = window.creationStorage;
-      var put = function (area) {
-        try {
-          if (cs && cs[area]) return cs[area].setItem(KEY_NAME, e64).then(function () { return true; })
-            .catch(function () { return false; });
-        } catch (e) {}
-        return Promise.resolve(false);
-      };
-      return put("secure").then(function (ok) { return ok || put("plain"); }).then(function (ok) {
-        if (!ok) { try { localStorage.setItem(KEY_NAME, e64); } catch (e) {} }
+      return waitForStorage(3000).then(function (cs) {
+        if (!cs) {
+          try {
+            localStorage.setItem(KEY_NAME, btoa(value));
+            if (decodeStored(localStorage.getItem(KEY_NAME)) === value) {
+              storageNote = "SAVED TO " + LABEL.local + " (NOT AN r1 CREATION)";
+              return "local";
+            }
+          } catch (e) {}
+          throw new Error("Could not save the key on this device.");
+        }
+        return writeArea("secure", value).then(function (ok) {
+          if (ok) { storageNote = "SAVED TO " + LABEL.secure + " · VERIFIED"; return "secure"; }
+          return writeArea("plain", value).then(function (ok2) {
+            if (ok2) { storageNote = "SAVED TO " + LABEL.plain + " · VERIFIED (SECURE FAILED)"; return "plain"; }
+            throw new Error("The r1 did not keep the key (secure and plain storage both failed). Not paired.");
+          });
+        });
       });
     },
     clear: function () {
-      var cs = window.creationStorage, jobs = [];
-      ["secure", "plain"].forEach(function (area) {
-        try { if (cs && cs[area]) jobs.push(cs[area].removeItem(KEY_NAME).catch(function () {})); } catch (e) {}
+      var jobs = ["secure", "plain"].map(function (n) {
+        var a = area(n);
+        if (!a) return Promise.resolve();
+        try { return withTimeout(a.removeItem(KEY_NAME), 4000).catch(function () {}); } catch (e) { return Promise.resolve(); }
       });
       try { localStorage.removeItem(KEY_NAME); } catch (e) {}
       return Promise.all(jobs);
@@ -709,14 +797,23 @@
     if (!subtle) return;
     pairStatus.textContent = "CHECKING…";
     pairStatus.className = "pair-status";
+    pairBtn.disabled = true;
     parsePairCode(pairInput.value).then(function (keyHex) {
-      return loadKeys(keyHex).then(function () { return keyStore.set(keyHex); });
+      // save and verify FIRST; only a key the r1 actually kept counts as paired
+      pairStatus.textContent = "SAVING…";
+      return keyStore.set(keyHex).then(function () { return loadKeys(keyHex); });
     }).then(function () {
+      pairBtn.disabled = false;
       pairInput.value = "";
-      pairStatus.textContent = "PAIRED.";
+      pairStatus.textContent = "PAIRED. " + storageNote + ".";
       pairStatus.className = "pair-status good";
-      setTimeout(showMenu, 700);
+      try { pairInput.blur(); } catch (e0) {}
+      setTimeout(function () {
+        try { showMenu(); flashHint(storageNote); }
+        catch (e1) { showPair("PAIRED, BUT THE MENU FAILED TO OPEN: " + String(e1 && e1.message || e1).toUpperCase(), true); }
+      }, 1800);
     }).catch(function (e) {
+      pairBtn.disabled = false;
       pairStatus.textContent = String((e && e.message) || "That key did not work.").toUpperCase();
       pairStatus.className = "pair-status bad";
     });
@@ -880,16 +977,18 @@
       renderRecent();
     });
     if (!subtle) { showPair(); return; }
+    // wait for the r1 storage read before deciding whether to ask for the key
     keyStore.get().then(function (keyHex) {
-      if (!keyHex || !/^[0-9a-f]{64}$/.test(keyHex)) { showPair(); return; }
+      if (!validKey(keyHex)) { showPair(storageNote); return; }
       return loadKeys(keyHex).then(function () {
+        flashHint(storageNote);
         showSaver();
         setTimeout(function () {
           if (screen === "saver") showMenu();
         }, 6000);
         resetIdle();
       });
-    }).catch(function () { showPair("STORED KEY COULD NOT BE LOADED. PAIR AGAIN.", true); });
+    }).catch(function () { showPair("STORED KEY COULD NOT BE LOADED. PAIR AGAIN. " + storageNote, true); });
   }
 
   if (typeof document !== "undefined") {

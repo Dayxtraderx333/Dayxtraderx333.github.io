@@ -31,7 +31,16 @@
 
   var PT_ZONE = "America/Los_Angeles";
   var IDLE_MS = 45000;
-  var WAIT_MS = 140000;      // how long the page waits for the desk to answer
+  var WAIT_MS = 140000;      // (legacy) old single-attempt wait; no longer used
+  // v6b (Nov 24 2026, quote hang): every request gets a hard deadline. A request
+  // held at the relay goes stale (bridge rejects ts older than 60 s and sends no
+  // reply), so each attempt gets a FRESH id + timestamp, its POST is aborted if it
+  // is not picked up quickly, and after the last attempt a clear error shows.
+  var TIMING = {
+    quote:   { attempts: 2, postMs: 4000, waitMs: 6000 },    // <= ~12 s total, then an error
+    _default: { attempts: 2, postMs: 6000, waitMs: 30000 }
+  };
+  function timingFor(cmd) { return TIMING[cmd] || TIMING._default; }
   var QUICK = ["SPY", "QQQ", "NVDA", "CRWV", "AAPL", "TSLA", "MSFT", "META"];
 
   // v5-compact (Nov 24 2026): six top-level sections; every older view is a
@@ -865,7 +874,7 @@
   // ---------------------------------------------------------------- relay
   function newId() { return randHex(16); }
 
-  function postRequest(id, ts, cmd, arg, token) {
+  function postRequest(id, ts, cmd, arg, token, signal) {
     var iv = new Uint8Array(12);
     crypto.getRandomValues(iv);
     var aad = enc.encode("req|" + PROTO + "|" + id + "|" + ts);
@@ -883,15 +892,19 @@
         var tries = 0;
         var send = function () {
           if (token !== undefined && token !== pollAbort) return null;
-          return fetch(RELAY + "/" + K.req, {
+          if (signal && signal.aborted) return Promise.reject(new Error("post-timeout"));
+          var opts = {
             method: "POST",
             headers: { "Content-Type": "text/plain;charset=UTF-8" },
             body: body,
             cache: "no-store"
-          }).then(function (r) {
+          };
+          if (signal) opts.signal = signal;
+          return fetch(RELAY + "/" + K.req, opts).then(function (r) {
             if (!r.ok) throw new Error("relay " + r.status);
             return true;
           }).catch(function (e) {
+            if (signal && signal.aborted) throw new Error("post-timeout");
             if (++tries >= 12 || (token !== undefined && token !== pollAbort)) throw e;
             return new Promise(function (res) { setTimeout(res, 600); }).then(send);
           });
@@ -914,7 +927,7 @@
 
   // Hold a blocking GET on this request's own reply channel. It resolves as
   // soon as the desk POSTs the answer, and gives up after WAIT_MS.
-  function awaitResult(id, cmd, token, channelP) {
+  function awaitResult(id, cmd, token, channelP, waitMs) {
     var ctl = null;
     var timer = null;
 
@@ -933,7 +946,7 @@
       timer = setTimeout(function () {
         try { if (ctl) ctl.abort(); } catch (e) {}
         reject(new Error("timeout"));
-      }, WAIT_MS);
+      }, waitMs || WAIT_MS);
       read().then(resolve, reject);
     });
 
@@ -973,17 +986,35 @@
     setOutput(label, '<span class="dim blink">CONNECTING…</span>',
       "REQUESTING " + label + " FROM THE DESK");
 
-    var ts = Math.floor(Date.now() / 1000);
-    var channelP = hmacHex("res-v1" + id).then(function (h) { return "td-" + h.slice(0, 32); });
-    var answered = awaitResult(id, cmd, token, channelP);
+    var tm = timingFor(cmd);
+    var startedAt = Date.now();
 
-    channelP.then(function () { return postRequest(id, ts, cmd, arg, token); })
-      .then(function () {
-        if (token !== pollAbort) return null;
-        setOutput(label, '<span class="dim blink">WORKING…</span>',
-          "RUNNING ON THE DESK");
-        return answered;
-      })
+    // one attempt = fresh id + fresh timestamp + its own reply channel
+    var attempt = function (n, rid) {
+      var ts = Math.floor(Date.now() / 1000);
+      var channelP = hmacHex("res-v1" + rid).then(function (h) { return "td-" + h.slice(0, 32); });
+      var answered = awaitResult(rid, cmd, token, channelP, tm.waitMs);
+      var ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+      var postTimer = setTimeout(function () { try { if (ctl) ctl.abort(); } catch (e) {} }, tm.postMs);
+      answered.catch(function () {});          // handled below; avoid unhandled rejections
+      return channelP.then(function () { return postRequest(rid, ts, cmd, arg, token, ctl && ctl.signal); })
+        .then(function (posted) {
+          clearTimeout(postTimer);
+          if (token !== pollAbort || posted === null) return null;
+          setOutput(label, '<span class="dim blink">WORKING…</span>',
+            (n > 1 ? "RETRY " + n + " · " : "") + "RUNNING ON THE DESK");
+          return answered;
+        }, function (e) { clearTimeout(postTimer); throw e; })
+        .catch(function (e) {
+          if (token !== pollAbort) return null;
+          if (n >= tm.attempts) throw e;
+          setOutput(label, '<span class="dim blink">RETRYING…</span>',
+            "NO ANSWER YET · RETRY " + (n + 1) + " OF " + tm.attempts);
+          return attempt(n + 1, newId());
+        });
+    };
+
+    attempt(1, id)
       .then(function (res) {
         if (token !== pollAbort) return;          // late answer to an old tap
         if (!res) { busy = false; resetIdle(); return; }
@@ -1002,11 +1033,13 @@
       })
       .catch(function () {
         if (token !== pollAbort) return;
+        var secs = Math.round((Date.now() - startedAt) / 1000);
         setOutput(label,
-          '<span class="down">NO RESPONSE FROM THE DESK.</span>\n' +
-          '<span class="dim">The desk machine did not answer. Tap the button again to retry. ' +
+          '<span class="down">NO RESPONSE FROM THE DESK' + (cmd === "quote" && arg ? " FOR " + String(arg).toUpperCase().replace(/[^A-Z0-9.\-^]/g, "") : "") +
+          ' AFTER ' + secs + ' S.</span>\n' +
+          '<span class="dim">' + (cmd === "quote" ? "Tap BACK and the symbol again to retry. " : "Tap the button again to retry. ") +
           'If this keeps happening, check the r1 clock is right or re-pair the device.</span>',
-          "OFFLINE");
+          "NO REPLY · " + tm.attempts + " TRIES");
       })
       .then(function () {
         if (token !== pollAbort) return;

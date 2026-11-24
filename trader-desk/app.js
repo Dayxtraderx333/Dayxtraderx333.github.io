@@ -197,7 +197,7 @@
   // because the r1 can inject them after the script starts. R1 speech is sent
   // as ONE message; the SDK has no stop call, so it plays to the end (<=350
   // chars). A status line under the output shows what was actually done.
-  var SPEAK_MAX = 350;
+  var SPEAK_MAX = 200;      // 1-2 sentences: starts faster, ends sooner
   var CHUNK_MAX = 170;
   var VOICE_MODES = ["r1direct", "r1", "web", "off"];
   var VOICE_NAMES = { r1direct: "R1 VOICE", r1: "R1 ASSIST", web: "WEB VOICE", off: "VOICE OFF" };
@@ -249,10 +249,46 @@
     return out;
   }
 
-  function stopSpeech() {
+  // r1 interrupt: the creations SDK documents no stop/cancel for r1 speech.
+  // Best-known trick: send a new, near-empty speak message so the r1 replaces
+  // what it is reading. Variants are selectable (tap the grey voice line on
+  // the output screen, or ?interrupt=space|dot|empty|none):
+  //   space  {message:" ",  useLLM:false, wantsR1Response:true}   (default)
+  //   dot    {message:".",  useLLM:false, wantsR1Response:true}
+  //   empty  {message:"",   useLLM:false, wantsR1Response:true}
+  //   none   send nothing
+  var INT_MODES = ["space", "dot", "empty", "none"];
+  var INT_MSG = { space: " ", dot: ".", empty: "" };
+  var intMode = "space";
+  try {
+    var qi = (location.search.match(/[?&]interrupt=(space|dot|empty|none)(&|$)/) || [])[1];
+    if (qi) intMode = qi;
+  } catch (e) {}
+  var r1SpeakingUntil = 0;     // when the current r1 reading should be over
+  var lastInterrupt = "";
+
+  function interruptR1(force) {
+    if (intMode === "none" || !hasBridge()) return false;
+    if (!force && Date.now() > r1SpeakingUntil) return false;   // nothing playing
+    try {
+      window.PluginMessageHandler.postMessage(JSON.stringify({
+        message: INT_MSG[intMode], useLLM: false, wantsR1Response: true, wantsJournalEntry: false
+      }));
+      r1SpeakingUntil = 0;
+      lastInterrupt = "INT " + intMode.toUpperCase() + " SENT " + hhmmss();
+      voiceStatus(voiceLine("STOPPED"));
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function stopSpeech(force) {
     speechGen++;
     try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (e) {}
-    // no documented stop for r1 speech; an r1 reading plays to the end
+    interruptR1(force === true);
+  }
+
+  function voiceLine(what) {
+    return "VOICE: " + VOICE_NAMES[voiceMode] + " · INT: " + intMode.toUpperCase() + (what ? " · " + what : "");
   }
 
   function speakR1(text, direct) {
@@ -294,7 +330,10 @@
       if (mode === "r1" || mode === "r1direct") {
         speakR1(summary, mode === "r1direct");
         lastSpeakAt = Date.now();
-        voiceStatus("VOICE: " + VOICE_NAMES[mode] + " · SENT " + summary.length + " CHARS · " + hhmmss() + " PT");
+        r1SpeakingUntil = lastSpeakAt + Math.round(summary.length / 14 * 1000) + 6000;
+        var tapMs = lastTapAt ? (lastSpeakAt - lastTapAt) : 0;
+        voiceStatus(voiceLine("SENT " + summary.length + " CH" + (tapMs ? " · TAP→SPEAK " + (tapMs / 1000).toFixed(1) + "S" : "")));
+        window.__tdLastTapToSpeakMs = tapMs;
       } else if (mode === "web") {
         speakWeb(summary, gen);
         voiceStatus("VOICE: WEB VOICE · SPEAKING " + summary.length + " CHARS · " + hhmmss() + " PT");
@@ -310,8 +349,8 @@
   window.onPluginMessage = function (data) {
     if (!lastSpeakAt) return;
     var kind = data && (data.type || (data.data ? "data" : data.message ? "message" : "event"));
-    voiceStatus("VOICE: " + VOICE_NAMES[voiceMode] + " · r1 REPLIED (" + String(kind || "?").toUpperCase() +
-      ") AFTER " + ((Date.now() - lastSpeakAt) / 1000).toFixed(1) + " S");
+    voiceStatus(voiceLine("r1 REPLIED (" + String(kind || "?").toUpperCase() +
+      ") +" + ((Date.now() - lastSpeakAt) / 1000).toFixed(1) + "S"));
   };
 
   function flashHint(text) {
@@ -322,6 +361,20 @@
     hint.textContent = text;
     setTimeout(function () { hint.textContent = orig; }, 6000);
   }
+
+  function cycleInterrupt() {
+    var k = INT_MODES.indexOf(intMode);
+    intMode = INT_MODES[(k + 1) % INT_MODES.length];
+    store.set("interrupt", intMode);
+    voiceStatus(voiceLine("SELECTED"));
+  }
+
+  // leaving the creation: stop the r1 reading
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "hidden") stopSpeech(true);
+  });
+  window.addEventListener("pagehide", function () { stopSpeech(true); });
+  window.addEventListener("beforeunload", function () { stopSpeech(true); });
 
   function cycleVoice() {
     stopSpeech();
@@ -663,7 +716,9 @@
     );
   }
 
+  var lastTapAt = 0;
   function runCommand(cmd, arg, label) {
+    lastTapAt = Date.now();
     stopSpeech();
     if (!K) { showPair(); return; }
     busy = true;
@@ -690,12 +745,12 @@
         lastRefresh = new Date();
         tickClocks();
         var body = res.text || "(no output)";
+        speak(body);                              // speak first, then render
         setOutput(
           label,
           renderText(body),
           (res.ok ? "" : "PARTIAL · ") + "UPDATED " + clockLabel(lastRefresh)
         );
-        speak(body);
         if (cmd === "quote" && res.ok) rememberTicker((res.arg || arg || "").toUpperCase());
       })
       .catch(function () {
@@ -977,6 +1032,11 @@
     if (title) title.addEventListener("click", function (ev) { ev.stopPropagation(); cycleVoice(); });
     // "voice2": earlier versions could save WEB VOICE when the r1 bridge was
     // injected late, which made the r1 silent; old choices are ignored.
+    store.get("interrupt").then(function (v) {
+      if (v && INT_MODES.indexOf(v) >= 0 && !/[?&]interrupt=/.test(location.search)) intMode = v;
+    });
+    var vsEl = document.getElementById("voiceStatus");
+    if (vsEl) vsEl.addEventListener("click", function (ev) { ev.stopPropagation(); cycleInterrupt(); });
     store.get("voice2").then(function (v) {
       if (v && VOICE_MODES.indexOf(v) >= 0 && !/[?&]voice=/.test(location.search)) voiceMode = v;
     });

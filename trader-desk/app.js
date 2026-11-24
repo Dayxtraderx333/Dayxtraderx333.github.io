@@ -178,6 +178,7 @@
   function resetIdle() {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(function () {
+      if (isReading()) { resetIdle(); return; }   // never blank the screen mid-read
       if (!busy && screen !== "pair") showSaver();
     }, IDLE_MS);
   }
@@ -279,7 +280,8 @@
   // Voice modes (tap the VOICE button on a result screen, or the TRADER DESK
   // title on the menu, to cycle). The SPEAK button reads the current screen.
   //   CUE   (default) speak "<button> ready" / "<TICKER> ready" — no numbers
-  //   FULL  read the first ~200 chars of the result (may be reworded by the r1)
+  //   FULL  read the ENTIRE result, in sentence chunks queued one after another
+  //         (v6 voice-full-read: no char cap; the old 200-char cap cut it short)
   //   OFF   silent
   // Speech call = the OS3-proven shape: PluginMessageHandler.postMessage(
   //   JSON.stringify({message, useLLM:false, wantsR1Response:true,
@@ -287,7 +289,16 @@
   //   it after load). No TTS stop exists in the SDK; on leaving the creation
   //   the page tries CreationVoiceHandler start/stop (grabs audio focus, if
   //   present) and closeWebView.
-  var SPEAK_MAX = 200;
+  // v6 (Nov 24 2026): no length cap in FULL mode or on SPEAK. Long text is split
+  // into sentence chunks (<= CHUNK_MAX chars) and queued: the next chunk starts
+  // only when the previous one ends, so the WebView never drops a long utterance
+  // and two queues never overlap (each new read bumps speechGen and cancels).
+  var CHUNK_MAX = 180;       // web speechSynthesis chunk size (Chrome stops ~15 s)
+  var R1_CHUNK_MAX = 320;    // r1 speaker chunk size (one message per chunk)
+  var R1_MS_PER_CHAR = 72;   // r1 TTS pace estimate (~14 chars/s) for pacing chunks
+  var R1_GAP_MS = 500;
+  var R1_NO_REPLY_MS = 1500;
+  var KEEPALIVE_MS = 10000;  // Chrome: pause/resume so long queues are not cut
   var VOICE_MODES = ["cue", "full", "off"];
   var VOICE_NAMES = { cue: "VOICE: CUE ONLY", full: "VOICE: READ FULL", off: "VOICE: OFF" };
   var CUES = {
@@ -301,7 +312,6 @@
     var qv = (location.search.match(/[?&]voice=(cue|full|off)(&|$)/) || [])[1];
     if (qv) voiceMode = qv;
   } catch (e) {}
-  var SPEAK_NOW_MAX = 400;   // SPEAK button: first ~400 chars of the screen
   var SHORT_NAMES = { cue: "VOICE: CUE", full: "VOICE: FULL", off: "VOICE: OFF" };
   var speechGen = 0;
   var lastSpeakAt = 0;
@@ -321,14 +331,40 @@
     if (el) el.textContent = text;
   }
 
-  function speechSummary(text, max) {
-    max = max || SPEAK_MAX;
-    var clean = String(text || "").replace(/\s+/g, " ").trim();
-    if (clean.length <= max) return clean;
-    var cut = clean.slice(0, max);
-    var m = cut.match(/^[\s\S]*[.!?](?=\s|$)/);
-    if (m && m[0].length > 60) return m[0];
-    return cut.replace(/\s+\S*$/, "") + ".";
+  // full text, whitespace collapsed; never shortened
+  function speechText(text) {
+    return String(text || "").replace(/\s+/g, " ").trim();
+  }
+
+  // split text into chunks of <= max chars at sentence ends, then at , ; : —,
+  // then at spaces. Joining the chunks with " " gives back the whole text.
+  function chunkText(text, max) {
+    max = max || CHUNK_MAX;
+    var clean = speechText(text);
+    if (!clean) return [];
+    // sentence ends = . ! ? followed by a space (so 0.88 or 11/23 never split)
+    var sentences = clean.replace(/([.!?])\s+/g, "$1\u0001").split("\u0001");
+    var pieces = [];
+    sentences.forEach(function (sen) {
+      sen = sen.trim();
+      if (!sen) return;
+      while (sen.length > max) {
+        var cut = sen.slice(0, max + 1);
+        var at = Math.max(cut.lastIndexOf(", "), cut.lastIndexOf("; "), cut.lastIndexOf(": "), cut.lastIndexOf(" — "));
+        if (at < max * 0.4) at = cut.lastIndexOf(" ");
+        if (at <= 0) at = max; else at += 1;
+        pieces.push(sen.slice(0, at).trim());
+        sen = sen.slice(at).trim();
+      }
+      if (sen) pieces.push(sen);
+    });
+    var chunks = [];
+    pieces.forEach(function (p) {
+      var last = chunks.length ? chunks[chunks.length - 1] : null;
+      if (last !== null && last.length + 1 + p.length <= max) chunks[chunks.length - 1] = last + " " + p;
+      else chunks.push(p);
+    });
+    return chunks;
   }
 
   function cueFor(cmd, arg, ok) {
@@ -336,8 +372,19 @@
     return ok === false ? c.replace(/ready$/, "partial result") : c;
   }
 
+  var speechTimer = null;     // r1 pacing / web watchdog
+  var keepAlive = null;
+  var r1Waiting = null;       // callback for the r1 reply to the chunk in flight
+  function clearSpeechTimers() {
+    if (speechTimer) { clearTimeout(speechTimer); speechTimer = null; }
+    if (keepAlive) { clearInterval(keepAlive); keepAlive = null; }
+    r1Waiting = null;
+  }
+  function isReading() { return !!(speechTimer || keepAlive || r1Waiting); }
+
   function stopSpeech() {
     speechGen++;
+    clearSpeechTimers();
     try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (e) {}
   }
 
@@ -351,32 +398,114 @@
   function speak(text, cmd, arg, ok) {
     stopSpeech();
     if (voiceMode === "off") { voiceStatus("VOICE OFF · TAP SPEAK TO HEAR THIS SCREEN"); return; }
-    var say = voiceMode === "full" ? speechSummary(text) : cueFor(cmd, arg, ok);
+    var say = voiceMode === "full" ? speechText(text) : cueFor(cmd, arg, ok);
     sendSpeech(say, VOICE_NAMES[voiceMode]);
   }
 
-  // sendSpeech(say, label): one OS3-shaped message to the r1 speaker
+  // sendSpeech(say, label): speak ALL of `say`, chunk by chunk, on the r1
+  // speaker (OS3-shaped messages) or the WebView's speechSynthesis.
   function sendSpeech(say, label) {
+    say = speechText(say);
     if (!say) return false;
-    try {
-      if (hasBridge()) {
-        sayR1(say);
-      } else if (hasWeb()) {
-        var u = new SpeechSynthesisUtterance(say);
-        window.speechSynthesis.speak(u);
-      } else {
-        voiceStatus(label + " · NO SPEECH CHANNEL IN THIS VIEW");
-        return false;
-      }
-      lastSpeakAt = Date.now();
-      var tapMs = lastTapAt ? (lastSpeakAt - lastTapAt) : 0;
-      window.__tdLastTapToSpeakMs = tapMs;
-      voiceStatus(label + " · SENT " + say.length + " CHARS");
-      return true;
-    } catch (e) {
-      voiceStatus(label + " · FAILED · " + String(e && e.message || e).toUpperCase().slice(0, 50));
+    var web = !hasBridge() && hasWeb();
+    if (!hasBridge() && !web) {
+      voiceStatus(label + " · NO SPEECH CHANNEL IN THIS VIEW");
       return false;
     }
+    stopSpeech();
+    var gen = speechGen;
+    var chunks = chunkText(say, web ? CHUNK_MAX : R1_CHUNK_MAX);
+    var total = say.length;
+    var i = 0;
+    window.__tdSpeech = { chars: total, chunks: chunks.length, spoken: 0 };
+    lastSpeakAt = Date.now();
+    window.__tdLastTapToSpeakMs = lastTapAt ? (lastSpeakAt - lastTapAt) : 0;
+
+    function progress() {
+      voiceStatus(label + " · READING " + Math.min(i + 1, chunks.length) + "/" + chunks.length +
+        " · " + total + " CHARS");
+    }
+    function done() {
+      if (gen !== speechGen) return;
+      clearSpeechTimers();
+      window.__tdSpeech.spoken = chunks.length;
+      voiceStatus(label + " · READ ALL " + total + " CHARS");
+      resetIdle();
+    }
+    function fail(e) {
+      if (gen !== speechGen) return;
+      clearSpeechTimers();
+      voiceStatus(label + " · FAILED AT " + (i + 1) + "/" + chunks.length + " · " +
+        String(e && e.message || e).toUpperCase().slice(0, 40));
+    }
+
+    if (web) {
+      var synth = window.speechSynthesis;
+      keepAlive = setInterval(function () {
+        if (gen !== speechGen) return;
+        try { if (synth.speaking && !synth.paused) { synth.pause(); synth.resume(); } } catch (e) {}
+      }, KEEPALIVE_MS);
+      var next = function () {
+        if (gen !== speechGen) return;
+        if (speechTimer) { clearTimeout(speechTimer); speechTimer = null; }
+        if (i >= chunks.length) { done(); return; }
+        var part = chunks[i];
+        var u = new SpeechSynthesisUtterance(part);
+        var advanced = false;
+        var advance = function () {
+          if (advanced || gen !== speechGen) return;
+          advanced = true;
+          i++;
+          window.__tdSpeech.spoken = i;
+          next();
+        };
+        u.onend = advance;
+        u.onerror = function (ev) {
+          var why = ev && ev.error;
+          if (why === "interrupted" || why === "canceled") return;  // our own cancel
+          advance();                                                // skip, keep going
+        };
+        // watchdog: some WebViews never fire onend; move on after a generous wait
+        speechTimer = setTimeout(advance, part.length * 120 + 8000);
+        progress();
+        try { synth.speak(u); } catch (e) { fail(e); }
+      };
+      next();
+      return true;
+    }
+
+    // r1 speaker: one message per chunk. The next chunk goes out when BOTH the
+    // estimated speaking time has passed and the r1 has replied to this chunk
+    // (or a short grace if no reply comes), so chunks never talk over each other.
+    var sendR1 = function () {
+      if (gen !== speechGen) return;
+      if (i >= chunks.length) { done(); return; }
+      var part = chunks[i];
+      var estMs = part.length * R1_MS_PER_CHAR + R1_GAP_MS;
+      var replied = false, timeUp = false;
+      var go = function () {
+        if (gen !== speechGen) return;
+        r1Waiting = null;
+        if (speechTimer) { clearTimeout(speechTimer); speechTimer = null; }
+        i++;
+        window.__tdSpeech.spoken = i;
+        sendR1();
+      };
+      r1Waiting = function () {
+        if (replied) return;
+        replied = true;
+        if (timeUp) { speechTimer = setTimeout(go, R1_GAP_MS); }   // reply after speech: short gap
+      };
+      speechTimer = setTimeout(function () {
+        timeUp = true;
+        if (replied) { go(); return; }
+        speechTimer = setTimeout(go, R1_NO_REPLY_MS);              // no reply yet: brief grace
+      }, estMs);
+      progress();
+      try { sayR1(part); } catch (e) { fail(e); }
+    };
+    sendR1();
+    return true;
   }
 
   // SPEAK button / wheel-free action: read the current screen right now,
@@ -389,7 +518,7 @@
       var raw = outBody ? (outBody.innerText || outBody.textContent || "") : "";
       text = raw.replace(/^(UPDATED|PARTIAL)[^\n]*\n?/, "");
     }
-    var say = speechSummary(text, SPEAK_NOW_MAX);
+    var say = speechText(text);
     if (!say || /^(READY|CONNECTING…|WORKING…)$/.test(say)) {
       toast("NOTHING TO READ YET");
       return;
@@ -436,6 +565,7 @@
   // r1 replies after a speak request arrive here; voice input is not used
   window.onPluginMessage = function (data) {
     if (!lastSpeakAt || (data && data.type === "sttEnded")) return;
+    if (r1Waiting) { r1Waiting(); return; }      // pacing the next chunk; keep READING n/m
     voiceStatus(VOICE_NAMES[voiceMode] + " · r1 REPLIED +" + ((Date.now() - lastSpeakAt) / 1000).toFixed(1) + "S");
   };
 
@@ -1138,8 +1268,11 @@
   });
 
   // tap anywhere wakes / resets idle
-  document.addEventListener("pointerdown", function () {
-    stopSpeech();
+  document.addEventListener("pointerdown", function (ev) {
+    // v6: touching/scrolling the result text no longer stops a FULL read;
+    // buttons, BACK, the side button and Space/Escape still stop it.
+    var inText = ev && ev.target && ev.target.closest && ev.target.closest("#outputBody");
+    if (!inText) stopSpeech();
     if (screen === "pair") return;
     if (screen === "saver") { showMenu(); }
     resetIdle();
@@ -1185,6 +1318,9 @@
       });
     }).catch(function () { showPair("STORED KEY COULD NOT BE LOADED. PAIR AGAIN. " + storageNote, true); });
   }
+
+  // test hook (speech only; no keys, no network): used by the voice tests
+  window.__tdSpeechTest = { speak: speak, speakNow: speakNow, chunkText: chunkText, stopSpeech: stopSpeech };
 
   if (typeof document !== "undefined") {
     if (document.readyState === "loading") {

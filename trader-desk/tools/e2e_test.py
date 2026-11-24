@@ -66,8 +66,11 @@ def roundtrip(client, rid, cmd, body, reply_client=None, wait=40, req_channel=No
     t = threading.Thread(target=lambda: out.setdefault("txt", get(f"{RELAY}/{rc.res(rid)}", wait)))
     t.start()
     time.sleep(0.4)
-    post(f"{RELAY}/{req_channel or client.req}", json.dumps(body) if isinstance(body, dict) else body,
-         timeout=min(wait, 30))
+    payload = json.dumps(body) if isinstance(body, dict) else body
+    for _ in range(4):   # like the page: retry if the relay drops the hand-over
+        if post(f"{RELAY}/{req_channel or client.req}", payload, timeout=min(wait, 30)):
+            break
+        time.sleep(0.6)
     t.join(wait + 5)
     txt = out.get("txt")
     if not txt:
@@ -110,7 +113,8 @@ def main():
         ok = bool(res and res.get("ok") and len(res.get("text", "")) > 40)
         check(f"{cmd} {arg}".strip(), ok,
               f"{len(res['text']) if res else 0} chars, {time.time()-t0:.1f}s")
-        last_body = (rid, cmd, body)
+        if ok:
+            last_body = (rid, cmd, body)   # replay test reuses a body the bridge answered
 
     # ---- unknown cmd (ops is no longer remote) and ticker injection
     rid, body = c.build("ops")

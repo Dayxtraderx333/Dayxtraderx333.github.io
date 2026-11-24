@@ -179,29 +179,53 @@
   }
 
   // ----------------------------------------------------------------- speech
-  // Speech is short (SPEAK_MAX chars, cut at a sentence end) and goes out in
-  // sentence-sized chunks, one at a time. stopSpeech() cancels whatever has
-  // not been spoken yet, and is called on every tap, Back, side button and new
-  // request, so switching buttons never waits for the old reading to finish.
+  // Spoken text is capped to SPEAK_MAX chars (cut at a sentence end); the
+  // full text stays on screen.
   //
   // Voice modes (tap the TRADER DESK title on the menu to cycle):
-  //   R1   r1 system speech via PluginMessageHandler (useLLM + wantsR1Response),
-  //        the documented path that speaks in the device's own voice.
-  //   WEB  the browser's speechSynthesis voice (fully interruptible).
-  //   OFF  silent; text on screen only.
+  //   R1 VOICE   (default) PluginMessageHandler {message, useLLM:false,
+  //              wantsR1Response:true, wantsJournalEntry:false} — byte-for-byte
+  //              the call the OS3-hosted page made, which is the one shape
+  //              proven to make sound on Anthony's r1.
+  //   R1 ASSIST  PluginMessageHandler {useLLM:true, wantsR1Response:true} —
+  //              the creations-SDK "Speak on R1" demo shape (the r1 assistant
+  //              reads it back); not confirmed to make sound on this r1.
+  //   WEB VOICE  speechSynthesis, chunked and instantly interruptible (often
+  //              missing in the r1 WebView).
+  //   OFF        silent.
+  // The r1 bridge objects are looked up when speaking, not at page load,
+  // because the r1 can inject them after the script starts. R1 speech is sent
+  // as ONE message; the SDK has no stop call, so it plays to the end (<=350
+  // chars). A status line under the output shows what was actually done.
   var SPEAK_MAX = 350;
   var CHUNK_MAX = 170;
-  var canBridge = typeof PluginMessageHandler !== "undefined";
-  var VOICE_MODES = ["r1", "web", "off"];
-  var VOICE_NAMES = { r1: "R1 VOICE", web: "WEB VOICE", off: "VOICE OFF" };
-  var voiceMode = canBridge ? "r1" : "web";
+  var VOICE_MODES = ["r1direct", "r1", "web", "off"];
+  var VOICE_NAMES = { r1direct: "R1 VOICE", r1: "R1 ASSIST", web: "WEB VOICE", off: "VOICE OFF" };
+  var voiceMode = "r1direct";
   try {
-    var qv = (location.search.match(/[?&]voice=(r1|web|off)\b/) || [])[1];
+    var qv = (location.search.match(/[?&]voice=(r1|r1direct|web|off)(&|$)/) || [])[1];
     if (qv) voiceMode = qv;
   } catch (e) {}
-  var speechGen = 0;          // bumps on every stop; stale chunk timers bail
-  var chunkTimer = null;
-  var awaitingR1 = null;      // callback fired when the r1 answers a chunk
+  var speechGen = 0;
+  var lastSpeakAt = 0;
+
+  function hasBridge() {
+    try {
+      return typeof window.PluginMessageHandler !== "undefined" && window.PluginMessageHandler &&
+        typeof window.PluginMessageHandler.postMessage === "function";
+    } catch (e) { return false; }
+  }
+  function hasWeb() {
+    return !!(window.speechSynthesis && typeof SpeechSynthesisUtterance !== "undefined");
+  }
+  function voiceStatus(text) {
+    var el = document.getElementById("voiceStatus");
+    if (el) el.textContent = text;
+  }
+  function hhmmss() {
+    var p = ptParts(new Date());
+    return p.hh + ":" + p.mm + ":" + p.ss;
+  }
 
   function speechSummary(text) {
     var clean = String(text || "").replace(/\s+/g, " ").trim();
@@ -225,81 +249,69 @@
     return out;
   }
 
-  function estMs(text) {
-    // ~15 spoken characters a second, plus a little breathing room
-    return Math.max(1200, Math.round(String(text || "").length / 15 * 1000) + 400);
-  }
-
   function stopSpeech() {
     speechGen++;
-    if (chunkTimer) { clearTimeout(chunkTimer); chunkTimer = null; }
-    awaitingR1 = null;
     try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (e) {}
-    // The r1 creations API documents no stop/cancel message for system speech,
-    // so an r1 chunk already being read finishes; every queued chunk is dropped.
+    // no documented stop for r1 speech; an r1 reading plays to the end
   }
 
-  function speakR1Chunk(chunk, gen, next) {
-    try {
-      PluginMessageHandler.postMessage(JSON.stringify({
-        message: "Read the following text aloud exactly as written, word for word. " +
-                 "Do not add, remove, rephrase or comment on anything. Text: " + chunk,
-        useLLM: true,
-        wantsR1Response: true,
-        wantsJournalEntry: false
-      }));
-    } catch (e) { return false; }
-    var done = false;
-    var advance = function (spokenLen) {
-      if (done || gen !== speechGen) return;
-      done = true;
-      awaitingR1 = null;
-      if (chunkTimer) clearTimeout(chunkTimer);
-      chunkTimer = setTimeout(function () { if (gen === speechGen) next(); },
-        estMs(new Array((spokenLen || chunk.length) + 1).join("x")));
-    };
-    // when the r1 answers, wait about as long as the reading takes, then go on
-    awaitingR1 = function (data) {
-      var t = data && (data.message || data.data);
-      advance(typeof t === "string" ? Math.min(t.length, chunk.length * 1.3) : chunk.length);
-    };
-    // fallback if the r1 never echoes anything back
-    chunkTimer = setTimeout(function () { advance(chunk.length); }, estMs(chunk) + 4000);
-    return true;
+  function speakR1(text, direct) {
+    var payload = direct
+      ? { message: text, useLLM: false, wantsR1Response: true, wantsJournalEntry: false }
+      : { message: "Read the following text aloud exactly as written, word for word. " +
+                   "Do not add, remove, rephrase or comment on anything. Text: " + text,
+          useLLM: true, wantsR1Response: true, wantsJournalEntry: false };
+    window.PluginMessageHandler.postMessage(JSON.stringify(payload));
   }
 
-  function speakWebChunk(chunk, gen, next) {
-    if (!window.speechSynthesis || typeof SpeechSynthesisUtterance === "undefined") return false;
-    try {
-      var u = new SpeechSynthesisUtterance(chunk);
-      u.rate = 1.02;
-      u.onend = function () { if (gen === speechGen) next(); };
-      u.onerror = function () { if (gen === speechGen) next(); };
-      window.speechSynthesis.speak(u);
-      return true;
-    } catch (e) { return false; }
-  }
-
-  function speak(text) {
-    stopSpeech();
-    if (!text || voiceMode === "off") return;
-    var chunks = speechChunks(speechSummary(text));
-    var gen = speechGen;
-    var i = 0;
-    var mode = (voiceMode === "r1" && canBridge) ? "r1" : "web";
+  function speakWeb(text, gen) {
+    var chunks = speechChunks(text), i = 0;
     var next = function () {
       if (gen !== speechGen || i >= chunks.length) return;
-      var c = chunks[i++];
-      var ok = mode === "r1" ? speakR1Chunk(c, gen, next) : speakWebChunk(c, gen, next);
-      if (!ok && mode === "r1") { mode = "web"; ok = speakWebChunk(c, gen, next); }
-      if (!ok) console.warn("no speech channel available in this view");
+      var u = new SpeechSynthesisUtterance(chunks[i++]);
+      u.rate = 1.02;
+      u.onend = function () { if (gen === speechGen) next(); };
+      u.onerror = function (ev) {
+        if (gen === speechGen) voiceStatus("VOICE: WEB VOICE ERROR " + ((ev && ev.error) || "").toUpperCase());
+      };
+      window.speechSynthesis.speak(u);
     };
     next();
   }
 
-  // r1 answers to our speech requests come back here; nothing is displayed
+  function speak(text) {
+    stopSpeech();
+    if (!text) return;
+    if (voiceMode === "off") { voiceStatus("VOICE: OFF (TAP TRADER DESK TITLE TO CHANGE)"); return; }
+    var summary = speechSummary(text);
+    var gen = speechGen;
+    var mode = voiceMode;
+    if ((mode === "r1" || mode === "r1direct") && !hasBridge()) {
+      mode = hasWeb() ? "web" : "none";
+    }
+    if (mode === "web" && !hasWeb()) mode = hasBridge() ? "r1direct" : "none";
+    try {
+      if (mode === "r1" || mode === "r1direct") {
+        speakR1(summary, mode === "r1direct");
+        lastSpeakAt = Date.now();
+        voiceStatus("VOICE: " + VOICE_NAMES[mode] + " · SENT " + summary.length + " CHARS · " + hhmmss() + " PT");
+      } else if (mode === "web") {
+        speakWeb(summary, gen);
+        voiceStatus("VOICE: WEB VOICE · SPEAKING " + summary.length + " CHARS · " + hhmmss() + " PT");
+      } else {
+        voiceStatus("VOICE: NO SPEECH CHANNEL IN THIS VIEW (NO R1 BRIDGE, NO WEB SPEECH)");
+      }
+    } catch (e) {
+      voiceStatus("VOICE: " + (VOICE_NAMES[mode] || mode) + " FAILED · " + String(e && e.message || e).toUpperCase().slice(0, 60));
+    }
+  }
+
+  // the r1 reports back here after a speak request; show only that it did
   window.onPluginMessage = function (data) {
-    if (awaitingR1) { var f = awaitingR1; f(data); }
+    if (!lastSpeakAt) return;
+    var kind = data && (data.type || (data.data ? "data" : data.message ? "message" : "event"));
+    voiceStatus("VOICE: " + VOICE_NAMES[voiceMode] + " · r1 REPLIED (" + String(kind || "?").toUpperCase() +
+      ") AFTER " + ((Date.now() - lastSpeakAt) / 1000).toFixed(1) + " S");
   };
 
   function flashHint(text) {
@@ -315,8 +327,8 @@
     stopSpeech();
     var k = VOICE_MODES.indexOf(voiceMode);
     voiceMode = VOICE_MODES[(k + 1) % VOICE_MODES.length];
-    if (voiceMode === "r1" && !canBridge) voiceMode = "web";
-    store.set("voice", voiceMode);
+    store.set("voice2", voiceMode);
+    voiceStatus("VOICE: " + VOICE_NAMES[voiceMode] + " SELECTED");
     var hint = document.querySelector(".menu-hint");
     if (hint) {
       var orig = hint.getAttribute("data-orig") || hint.textContent;
@@ -963,10 +975,10 @@
     renderChips();
     var title = document.querySelector("#menu .hdr-title");
     if (title) title.addEventListener("click", function (ev) { ev.stopPropagation(); cycleVoice(); });
-    store.get("voice").then(function (v) {
-      if (v && VOICE_MODES.indexOf(v) >= 0 && !/[?&]voice=/.test(location.search)) {
-        voiceMode = (v === "r1" && !canBridge) ? "web" : v;
-      }
+    // "voice2": earlier versions could save WEB VOICE when the r1 bridge was
+    // injected late, which made the r1 silent; old choices are ignored.
+    store.get("voice2").then(function (v) {
+      if (v && VOICE_MODES.indexOf(v) >= 0 && !/[?&]voice=/.test(location.search)) voiceMode = v;
     });
     store.get("recent").then(function (raw) {
       if (!raw) return;

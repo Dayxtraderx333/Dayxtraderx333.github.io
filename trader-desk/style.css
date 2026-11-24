@@ -196,6 +196,10 @@ html, body {
   border-left-color: var(--green);
   color: var(--green);
 }
+/* v5-compact section sub-menus */
+.cmd.raw { border-left-color: var(--dim); color: #c3c9cd; font-size: 12px; }
+.cmd.navback { border-left-color: #2a3136; color: var(--dim); font-size: 11px; min-height: 36px; }
+.sub-note { font-size: 8px; letter-spacing: 1px; color: var(--dim); text-align: center; padding: 2px 0; }
 
 /* ---------- ticker screen ---------- */
 .ticker-row {

@@ -34,20 +34,47 @@
   var WAIT_MS = 140000;      // how long the page waits for the desk to answer
   var QUICK = ["SPY", "QQQ", "NVDA", "CRWV", "AAPL", "TSLA", "MSFT", "META"];
 
+  // v5-compact (Nov 24 2026): six top-level sections; every older view is a
+  // sub-item of its parent section. Commands are unchanged (no bridge change).
+  var SECTIONS = [
+    { id: "morning", label: "MORNING BRIEF", items: [
+      { cmd: "brief", label: "MANAGER BRIEF" },
+      { cmd: "whales", label: "WHALES · RAW SCAN", raw: true },
+      { cmd: "oversold", label: "OVERSOLD · RAW SCAN", raw: true },
+      { cmd: "research", label: "RESEARCH · RAW SCAN", raw: true }
+    ], note: "RAW SCANS ARE NOT VERIFIED BY MANAGER" },
+    { id: "top3", label: "TOP 3", cmd: "top3" },
+    { id: "pulse", label: "MARKET PULSE", cmd: "pulse" },
+    { id: "spy", label: "SPY 0DTE", items: [
+      { cmd: "spy", label: "SPY DESK" },
+      { cmd: "optbrief", label: "OPTIONS BRIEFS" },
+      { cmd: "tape", label: "TAPE 0DTE" },
+      { cmd: "options", label: "OPTIONS DESK" }
+    ] },
+    { id: "quote", label: "TICKER LOOKUP", cmd: "quote" },
+    { id: "score", label: "SCORECARD", items: [
+      { cmd: "scorecard", label: "SCORECARD BY BOT" },
+      { cmd: "botstatus", label: "WHO FILED TODAY" }
+    ] }
+  ];
+  var RAW_NOTE = "RAW SCAN, NOT VERIFIED BY MANAGER";
+  var RAW = { whales: true, oversold: true, research: true };
+  var currentSec = null;     // null = top-level menu
+
   var LABELS = {
     brief: "MORNING BRIEF",
     pulse: "MARKET PULSE",
-    spy: "SPY / 0DTE",
+    spy: "SPY 0DTE",
     options: "OPTIONS DESK",
     quote: "TICKER LOOKUP",
     scorecard: "SCORECARD",
     botstatus: "BOT STATUS",
     top3: "TOP 3",
-    optbrief: "OPTIONS BRIEF",
+    optbrief: "OPTIONS BRIEFS",
     tape: "TAPE 0DTE",
-    whales: "WHALES",
-    oversold: "OVERSOLD",
-    research: "RESEARCH"
+    whales: "WHALES · RAW",
+    oversold: "OVERSOLD · RAW",
+    research: "RESEARCH · RAW"
   };
 
   // --- elements -----------------------------------------------------------
@@ -155,6 +182,63 @@
     idleTimer = setTimeout(function () {
       if (!busy && screen !== "pair") showSaver();
     }, IDLE_MS);
+  }
+
+  function findSection(id) {
+    for (var i = 0; i < SECTIONS.length; i++) if (SECTIONS[i].id === id) return SECTIONS[i];
+    return null;
+  }
+
+  function addBtn(text, attr, val, extra) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "cmd" + (extra ? " " + extra : "");
+    b.setAttribute(attr, val);
+    b.textContent = text;
+    buttons.appendChild(b);
+    return b;
+  }
+
+  // Render the top-level list (sec = null) or one section's sub-items.
+  function renderMenu(sec) {
+    currentSec = sec ? sec.id : null;
+    buttons.innerHTML = "";
+    var title = document.querySelector("#menu .hdr-title");
+    if (!sec) {
+      if (title) title.textContent = "TRADER DESK";
+      SECTIONS.forEach(function (s) { addBtn(s.label, "data-sec", s.id); });
+      return;
+    }
+    if (title) title.textContent = sec.label;
+    sec.items.forEach(function (it) { addBtn(it.label, "data-cmd", it.cmd, it.raw ? "raw" : ""); });
+    if (sec.note) {
+      var n = document.createElement("div");
+      n.className = "sub-note";
+      n.textContent = sec.note;
+      buttons.appendChild(n);
+    }
+    addBtn("\u2039 ALL SECTIONS", "data-nav", "top", "navback");
+  }
+
+  function openSection(id) {
+    var sec = findSection(id);
+    if (!sec) return;
+    if (!sec.items) {
+      if (sec.cmd === "quote") { openTicker(); return; }
+      runCommand(sec.cmd, "", LABELS[sec.cmd] || sec.label);
+      return;
+    }
+    renderMenu(sec);
+    selected = 0;
+    showMenu();
+  }
+
+  function goTop() {
+    var from = currentSec;
+    renderMenu(null);
+    selected = 0;
+    for (var i = 0; i < SECTIONS.length; i++) if (SECTIONS[i].id === from) selected = i;
+    showMenu();
   }
 
   function showMenu() {
@@ -783,6 +867,7 @@
         setOutput(
           label,
           renderText(body),
+          (RAW[cmd] ? RAW_NOTE + " · " : "") +
           (res.ok ? "" : "PARTIAL · ") + "UPDATED " + clockLabel(lastRefresh)
         );
         if (cmd === "quote" && res.ok) rememberTicker((res.arg || arg || "").toUpperCase());
@@ -952,7 +1037,10 @@
     if (!btn) return;
     stopSpeech();
     resetIdle();
+    if (btn.dataset.nav === "top") { goTop(); return; }
+    if (btn.dataset.sec) { openSection(btn.dataset.sec); return; }
     var cmd = btn.dataset.cmd;
+    if (!cmd) return;
     if (cmd === "quote") { openTicker(); return; }
     runCommand(cmd, "", LABELS[cmd] || cmd.toUpperCase());
   });
@@ -1046,6 +1134,7 @@
       onScrollDelta(-1);
     } else if (ev.key === "Escape") {
       if (screen !== "menu") { pollAbort++; busy = false; showMenu(); }
+      else if (currentSec) goTop();
       else onLeave("back");
     }
   });
@@ -1060,6 +1149,7 @@
 
   // ------------------------------------------------------------------ boot
   function boot() {
+    renderMenu(null);
     tickClocks();
     setInterval(tickClocks, 1000);
     renderChips();

@@ -472,22 +472,34 @@
   // ---------------------------------------------------------------- relay
   function newId() { return randHex(16); }
 
-  function postRequest(id, ts, cmd, arg) {
+  function postRequest(id, ts, cmd, arg, token) {
     var iv = new Uint8Array(12);
     crypto.getRandomValues(iv);
     var aad = enc.encode("req|" + PROTO + "|" + id + "|" + ts + "|" + cmd);
     var pt = enc.encode(JSON.stringify({ cmd: cmd, arg: arg || "" }));
     return subtle.encrypt({ name: "AES-GCM", iv: iv, additionalData: aad }, K.aes, pt)
       .then(function (ct) {
-        return fetch(RELAY + "/" + K.req, {
-          method: "POST",
-          headers: { "Content-Type": "text/plain;charset=UTF-8" },
-          body: JSON.stringify({ v: PROTO, id: id, ts: ts, cmd: cmd, iv: b64(iv), ct: b64(ct) }),
-          cache: "no-store"
-        });
-      }).then(function (r) {
-        if (!r.ok) throw new Error("relay " + r.status);
-        return true;
+        var body = JSON.stringify({ v: PROTO, id: id, ts: ts, cmd: cmd, iv: b64(iv), ct: b64(ct) });
+        // The relay allows one sender per channel at a time, so a quick second
+        // tap can be refused while the first is still being handed over.
+        // Retry briefly; a duplicate delivery is dropped by the bridge as a replay.
+        var tries = 0;
+        var send = function () {
+          if (token !== undefined && token !== pollAbort) return null;
+          return fetch(RELAY + "/" + K.req, {
+            method: "POST",
+            headers: { "Content-Type": "text/plain;charset=UTF-8" },
+            body: body,
+            cache: "no-store"
+          }).then(function (r) {
+            if (!r.ok) throw new Error("relay " + r.status);
+            return true;
+          }).catch(function (e) {
+            if (++tries >= 12 || (token !== undefined && token !== pollAbort)) throw e;
+            return new Promise(function (res) { setTimeout(res, 600); }).then(send);
+          });
+        };
+        return send();
       });
   }
 
@@ -565,7 +577,7 @@
     var channelP = hmacHex("res-v1" + id).then(function (h) { return "td-" + h.slice(0, 32); });
     var answered = awaitResult(id, cmd, token, channelP);
 
-    channelP.then(function () { return postRequest(id, ts, cmd, arg); })
+    channelP.then(function () { return postRequest(id, ts, cmd, arg, token); })
       .then(function () {
         if (token !== pollAbort) return null;
         setOutput(label, '<span class="dim blink">WORKING…</span>',
